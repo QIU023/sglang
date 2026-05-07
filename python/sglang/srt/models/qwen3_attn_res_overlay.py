@@ -63,8 +63,10 @@ from sglang.srt.layers.attn_res import (
     zero_init_pseudo_query,
 )
 
+import logging as _logging
 import os as _os
 _SEQ_SHARD_ENABLED = bool(int(_os.environ.get("SGLANG_ATTN_RES_SEQ_SHARD", "0")))
+_logger = _logging.getLogger(__name__)
 
 
 def _query_from_proj(proj):
@@ -253,6 +255,12 @@ class Qwen3BlockAttnResModel(Qwen3Model):
         self.layers_per_block = max(1, config.num_hidden_layers // n_blocks)
 
     def _seq_shard_active(self, partial_block: torch.Tensor) -> bool:
+        """See ``KimiBlockAttnResModel._seq_shard_active`` for full doc.
+
+        Same three-condition gate; logs a once-per-instance warning when
+        seq-shard is requested but num_tokens is not TP-divisible (typical
+        on batch=1 decode steps).
+        """
         if not _SEQ_SHARD_ENABLED:
             return False
         from sglang.srt.distributed import get_tensor_model_parallel_world_size
@@ -260,6 +268,14 @@ class Qwen3BlockAttnResModel(Qwen3Model):
         if tp_size == 1:
             return False
         if partial_block.shape[0] % tp_size != 0:
+            if not getattr(self, "_seq_shard_fallback_warned", False):
+                _logger.warning(
+                    "AttnRes seq-shard requested (SGLANG_ATTN_RES_SEQ_SHARD=1) "
+                    "but num_tokens=%d is not divisible by TP=%d on this "
+                    "forward; falling back to replicated mode for this call.",
+                    partial_block.shape[0], tp_size,
+                )
+                self._seq_shard_fallback_warned = True
             return False
         return True
 
@@ -457,6 +473,19 @@ class Qwen3BlockAttnResForCausalLM(Qwen3ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        # AttnRes overlay does not currently support DP attention. See the
+        # Kimi overlay for the full reasoning; same constraint applies here
+        # because we similarly bypass ``layer_communicator.prepare_attn``.
+        try:
+            from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+            if is_dp_attention_enabled():
+                raise NotImplementedError(
+                    "Block AttnRes overlay (Qwen3 carrier) does not yet support "
+                    "DP attention. Disable via --disable-dp-attention."
+                )
+        except ImportError:
+            pass
+
         # Skip Qwen3ForCausalLM.__init__'s self.model construction and
         # call grandparent (nn.Module) directly so we can wire in our
         # AttnRes model class instead.

@@ -159,16 +159,67 @@ def block_attn_res_phase1(
         f"queries ({len(queries)}) and norms ({len(norms)}) length mismatch"
 
     V = torch.stack(committed_blocks, dim=0)   # (N, *, D)
+    Q = len(queries)
 
+    # Try the vectorised path first: when all per-layer RMSNorms share the
+    # same epsilon (true for Kimi/Qwen3 where every layernorm is constructed
+    # with ``eps=config.rms_norm_eps``), we can compute ``rsqrt(V^2.mean)``
+    # ONCE on the shared V, then fold each layer's gamma into a per-query
+    # effective query ``q_eff = q * gamma``. The whole batch then collapses
+    # to two batched einsums plus one max+softmax, replacing the per-query
+    # RMSNorm + einsum loop. ~Q× speedup at the cost of one assertion.
+    eps_set = set()
+    for n in norms:
+        e = getattr(n, "variance_epsilon", None)
+        if e is None:
+            e = getattr(n, "eps", None)
+        eps_set.add(e)
+
+    can_vectorise = (
+        len(eps_set) == 1
+        and None not in eps_set
+        and all(hasattr(n, "weight") for n in norms)
+    )
+
+    if can_vectorise:
+        eps = next(iter(eps_set))
+        # Stack gammas (Q, D) and queries (Q, D); fold gamma into query.
+        gammas = torch.stack(
+            [n.weight.to_local() if hasattr(n.weight, "to_local") else n.weight
+             for n in norms],
+            dim=0,
+        )  # (Q, D)
+        queries_t = torch.stack(queries, dim=0).to(gammas.dtype)  # (Q, D)
+        q_eff = queries_t * gammas  # (Q, D)
+
+        # Shared rsqrt over V (fp32 for stability — matches sgl_kernel rmsnorm).
+        V_f32 = V.to(torch.float32)
+        rsqrt = torch.rsqrt(V_f32.pow(2).mean(-1, keepdim=True) + eps)
+        V_normed = (V_f32 * rsqrt).to(V.dtype)  # (N, *, D)
+
+        # Batched score: logits[q, n, t...] = sum_d q_eff[q, d] * V_normed[n, t..., d]
+        logits = torch.einsum("qd, n...d -> qn...", q_eff, V_normed)  # (Q, N, *)
+
+        # Numerically-stable softmax over the N (block) axis (dim=1 of (Q,N,*)).
+        m = logits.max(dim=1, keepdim=True).values                     # (Q, 1, *)
+        exp_l = torch.exp(logits - m)                                  # (Q, N, *)
+        Z = exp_l.sum(dim=1)                                           # (Q, *)
+        # Weighted V sum:  out[q, t..., d] = sum_n exp_l[q, n, t...] * V[n, t..., d] / Z[q, t...]
+        committed_parts = (
+            torch.einsum("qn..., n...d -> q...d", exp_l, V)
+            / Z.unsqueeze(-1)
+        )  # (Q, *, D)
+        lses = m.squeeze(1) + torch.log(Z)  # (Q, *)
+
+        return [(committed_parts[i], lses[i]) for i in range(Q)]
+
+    # Fallback: per-query loop. Hits when norms have heterogeneous eps,
+    # which would happen if a downstream caller passes RMSNorms from
+    # multiple model files with different defaults. Same math, slower.
     out: list[Optional[tuple[torch.Tensor, torch.Tensor]]] = []
     for q, norm in zip(queries, norms):
-        # Each (layer, query_type) has its own RMSNorm gamma — re-norm V
-        # per query. The norm result is a (N, *, D) tensor that's used
-        # only inside this iteration; no cross-query sharing.
         K = norm(V)                                                  # (N, *, D)
         logits = torch.einsum("d, n...d -> n...", q, K)              # (N, *)
-
-        # Numerically stable softmax over the N (block) axis.
         m = logits.max(dim=0).values                                 # (*,)
         exp_l = torch.exp(logits - m.unsqueeze(0))                   # (N, *)
         Z = exp_l.sum(dim=0)                                         # (*,)

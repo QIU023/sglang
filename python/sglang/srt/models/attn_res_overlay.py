@@ -74,34 +74,66 @@ from sglang.srt.layers.attn_res import (
     zero_init_pseudo_query,
 )
 
-import contextlib
+import logging as _logging
 import os as _os
 
 
 _SEQ_SHARD_ENABLED = bool(int(_os.environ.get("SGLANG_ATTN_RES_SEQ_SHARD", "0")))
 
+_logger = _logging.getLogger(__name__)
 
-@contextlib.contextmanager
-def _kimi_moe_no_op_all_reduce():
-    """Disable KimiMoE's hardcoded ``tensor_model_parallel_all_reduce``.
 
-    Upstream ``KimiMoE.forward`` (sglang/srt/models/kimi_linear.py) has a
-    hardcoded ``tensor_model_parallel_all_reduce(final_hidden_states)``
-    after experts + shared_experts merge. There is no flag to disable
-    it (unlike ``RowParallelLinear.reduce_results``).
+def _kimi_moe_partial_sum(mlp, hidden_states: torch.Tensor) -> torch.Tensor:
+    """Inline replica of ``KimiMoE.forward`` minus the trailing all-reduce.
 
-    For the seq-shard path we want the partial-sum output (so we can
-    reduce-scatter along seq dim). Swap the module-level binding to
-    identity for the duration of the wrapped call. Single-threaded
-    forward, so no concurrency concern.
+    Upstream ``KimiMoE.forward`` ends with ``tensor_model_parallel_all_reduce``
+    on the experts+shared_experts sum, returning a *replicated* result.
+    For the seq-shard inference path we instead want the *partial-sum*
+    output so the caller can ``reduce_scatter`` along the seq dim.
+
+    KimiMoE has no ``reduce_results`` flag (unlike ``RowParallelLinear``),
+    so we replicate the body of its forward minus the final AR, calling
+    the same submodules (``gate``, ``topk``, ``experts``, optional
+    ``shared_experts``) in the same order. Stays consistent with upstream
+    if ``KimiMoE.forward``'s sub-call sequence stays stable; if upstream
+    rearranges it, we'd need to mirror.
+
+    The alt_stream branch in upstream is a perf optimisation that overlaps
+    shared_experts with the experts kernel via a CUDA stream — we follow
+    the simpler (no-alt_stream) branch since this overlay's primary
+    target is correctness, not throughput.
     """
-    import sglang.srt.models.kimi_linear as _kml
-    orig = _kml.tensor_model_parallel_all_reduce
-    _kml.tensor_model_parallel_all_reduce = lambda x: x
-    try:
-        yield
-    finally:
-        _kml.tensor_model_parallel_all_reduce = orig
+    num_tokens, hidden_size = hidden_states.shape
+    h = hidden_states.view(-1, hidden_size)
+
+    shared_output = None
+    if mlp.num_shared_experts is not None and h.shape[0] > 0:
+        shared_output = mlp.shared_experts(h)
+
+    router_logits, _ = mlp.gate(h)
+    topk_output = mlp.topk(h, router_logits)
+    final_hidden_states = mlp.experts(h, topk_output)
+
+    if shared_output is not None:
+        final_hidden_states = final_hidden_states + shared_output
+
+    # NB: trailing tensor_model_parallel_all_reduce intentionally elided.
+    return final_hidden_states.view(num_tokens, hidden_size)
+
+
+def _is_kimi_moe(mlp) -> bool:
+    """Detect whether a layer's ``mlp`` is KimiMoE (has hardcoded AR).
+
+    Avoids importing KimiMoE directly (circular under some load orders);
+    duck-types on the ``num_shared_experts`` + ``gate`` + ``topk`` + ``experts``
+    attributes that ``_kimi_moe_partial_sum`` depends on.
+    """
+    return (
+        hasattr(mlp, "num_shared_experts")
+        and hasattr(mlp, "gate")
+        and hasattr(mlp, "topk")
+        and hasattr(mlp, "experts")
+    )
 
 
 def _query_from_proj(proj: nn.Linear) -> torch.Tensor:
@@ -247,13 +279,14 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
         if seq_shard:
             mlp_in_shard = self.post_attention_layernorm(mlp_input)
             mlp_in_replicated = all_gather_seq(mlp_in_shard)
-            # KimiMoE has a hardcoded ``tensor_model_parallel_all_reduce``
-            # we have to noop. Dense KimiMLP has ``down_proj.reduce_results=False``
-            # set at __init__, so it just returns the partial sum.
-            if self.is_moe and getattr(self.mlp, "block_sparse_moe", None) is not None \
-                    or self.mlp.__class__.__name__ in ("KimiMoE", "block_sparse_moe"):
-                with _kimi_moe_no_op_all_reduce():
-                    mlp_partial = self.mlp(mlp_in_replicated)
+            # MoE layers: KimiMoE has a hardcoded all-reduce in its forward
+            # (no ``reduce_results`` flag). Use ``_kimi_moe_partial_sum`` to
+            # call the underlying gate / topk / experts modules in the same
+            # order as upstream KimiMoE.forward, but skip the trailing AR.
+            # Dense KimiMLP layer has ``down_proj.reduce_results=False`` set
+            # at __init__, so its forward already returns the partial sum.
+            if _is_kimi_moe(self.mlp):
+                mlp_partial = _kimi_moe_partial_sum(self.mlp, mlp_in_replicated)
             else:
                 mlp_partial = self.mlp(mlp_in_replicated)
             return reduce_scatter_seq(mlp_partial)
@@ -374,6 +407,10 @@ class KimiBlockAttnResModel(KimiLinearModel):
         2. TP world size > 1 (else nothing to shard across).
         3. ``num_tokens % tp_size == 0`` (decode with batch size 1 has
            ``num_tokens=1`` which is not divisible — fall back to replicated).
+
+        Logs a once-per-instance warning when the user requested seq-shard
+        but condition 3 forced the fallback, so they aren't surprised by
+        silent perf degradation.
         """
         if not _SEQ_SHARD_ENABLED:
             return False
@@ -382,6 +419,17 @@ class KimiBlockAttnResModel(KimiLinearModel):
         if tp_size == 1:
             return False
         if partial_block.shape[0] % tp_size != 0:
+            if not getattr(self, "_seq_shard_fallback_warned", False):
+                _logger.warning(
+                    "AttnRes seq-shard requested (SGLANG_ATTN_RES_SEQ_SHARD=1) "
+                    "but num_tokens=%d is not divisible by TP=%d on this "
+                    "forward; falling back to replicated mode for this call. "
+                    "This typically happens for decode steps where "
+                    "num_tokens < TP. Prefill chunks aligned to a TP-multiple "
+                    "do exercise the seq-shard path.",
+                    partial_block.shape[0], tp_size,
+                )
+                self._seq_shard_fallback_warned = True
             return False
         return True
 
@@ -654,6 +702,25 @@ class KimiBlockAttnResForCausalLM(KimiLinearForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
+        # AttnRes overlay does not currently support DP attention. The
+        # ``_run_attn`` / ``_run_mlp`` helpers bypass
+        # ``LayerCommunicator.prepare_attn`` (because AttnRes replaces the
+        # PreNorm fused-residual-add path entirely) which is also where DP
+        # attention scatter routing lives. Adding DP-attn support requires
+        # threading the DP scatter mode manually around our ``self_attn``
+        # call. Until that's done, refuse rather than silently produce
+        # wrong results.
+        try:
+            from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+            if is_dp_attention_enabled():
+                raise NotImplementedError(
+                    "Block AttnRes overlay does not yet support DP attention. "
+                    "Disable via --disable-dp-attention (or omit --enable-dp-attention) "
+                    "and re-launch. Tracking issue: phase 11 follow-up."
+                )
+        except ImportError:
+            pass  # Older sglang without is_dp_attention_enabled — assume off.
+
         # Skip upstream KimiLinearForCausalLM.__init__'s self.model
         # construction — we want our AttnRes model class instead — and
         # call grandparent (nn.Module) __init__ directly.
@@ -757,33 +824,43 @@ class KimiBlockAttnResForCausalLM(KimiLinearForCausalLM):
                 delattr(cfg_cls, "full_attention_layer_ids")
 
     def _force_fp32_required_params(self) -> None:
-        """Apply post-construction compatibility patches to make this
-        non-mainline model class run under upstream's stock kernels.
+        """Apply post-construction instance-scoped patches to make this
+        non-mainline overlay class run under upstream's stock kernels.
 
-        Two patches:
+        Two scoped patches:
 
-        1. ``e_score_correction_bias`` → fp32. Upstream ``KimiMoE.__init__``
-           (sglang/srt/models/kimi_linear.py) sets ``self.gate.e_score_correction_bias
-           = nn.Parameter(torch.empty(num_experts))`` with no dtype kwarg.
-           The downstream ``biased_grouped_topk_gpu`` path
-           (sglang/srt/layers/moe/topk.py:842) casts ``gating_output`` to
-           fp32 before the kernel call but passes the correction bias
-           unchanged; the sgl_kernel ``moe_fused_gate`` asserts both
-           dtypes match and crashes with "input and bias should have the
-           same dtype". Mutate in place via ``.data = ...`` because
-           ``TopK(correction_bias=self.gate.e_score_correction_bias)``
-           captures the original Parameter reference.
+        1. ``e_score_correction_bias`` → fp32 (single Parameter mutation
+           per MoE gate, ~26 params total at 16 layers; no global state
+           change). Upstream ``KimiMoE.__init__``
+           (sglang/srt/models/kimi_linear.py:91) sets
+           ``self.gate.e_score_correction_bias = nn.Parameter(
+           torch.empty(num_experts))`` with no dtype kwarg, picking
+           default bf16 under the engine's load context. The downstream
+           ``biased_grouped_topk_gpu`` path (layers/moe/topk.py:842)
+           casts gating_output to fp32 then passes the bias unchanged;
+           the sgl_kernel ``moe_fused_gate`` then crashes with
+           "input and bias should have the same dtype". Mutate the
+           Parameter ``.data`` in place so the existing
+           ``TopK(correction_bias=...)`` reference automatically picks up
+           the new dtype. Should ideally be a one-line upstream fix in
+           ``KimiMoE.__init__``; until then this overlay carries it.
 
-        2. ``RMSNorm`` autopatch for non-contiguous input. MLA's
-           ``forward_absorb_prepare`` does
-           ``compressed_kv.split([kv_lora_rank, qk_rope_head_dim], dim=-1)``
-           which yields a non-contiguous ``k_nope`` view with
-           ``stride[0] = kv_lora_rank + qk_rope_head_dim``. Flashinfer's
-           rmsnorm requires ``stride[0]`` to be element-aligned to 8;
-           with our 436M dims (584 + 36 = 620), it isn't. Wrap
-           ``forward_cuda`` to ``.contiguous()`` non-contiguous inputs.
+        2. Per-instance ``.contiguous()`` shim on each MLA layer's
+           ``self_attn.kv_a_layernorm``. ``forward_absorb_prepare`` in
+           ``deepseek_common`` splits ``compressed_kv`` along dim -1
+           into ``(k_nope, k_pe)`` producing non-contig views. The
+           sgl_kernel rmsnorm requires ``stride[0]`` aligned to 8
+           elements; for some kv_lora_rank values (notably the original
+           436M's 584 + 36 = 620) the resulting stride isn't, and the
+           kernel ``ValueError("Invalid mX.strides[0]...")``. Aligned
+           variants (kv_lora_rank multiple of 64) don't trigger this,
+           so on the canonical phase 11 ckpt (kv_lora=512) this shim is
+           a no-op. Scoped to ``kv_a_layernorm`` instances **owned by
+           this model only** — does NOT mutate the upstream ``RMSNorm``
+           class itself, so other RMSNorm uses in the engine are
+           unaffected.
         """
-        # Patch 1
+        # Patch 1 — fp32 e_score_correction_bias on every MoE gate.
         for module in self.modules():
             gate = getattr(module, "gate", None)
             if gate is None:
@@ -793,27 +870,33 @@ class KimiBlockAttnResForCausalLM(KimiLinearForCausalLM):
                 continue
             bias.data = bias.data.to(torch.float32)
 
-        # Patch 2 — wrap RMSNorm.forward_cuda to enforce contiguous input.
-        from sglang.srt.layers.layernorm import RMSNorm
-        if not getattr(RMSNorm, "_attnres_contiguous_patched", False):
-            orig = RMSNorm.forward_cuda
+        # Patch 2 — instance-scoped .contiguous() shim on each MLA's
+        # kv_a_layernorm only. Avoids the previous version's class-level
+        # mutation of ``RMSNorm.forward_cuda`` which had been bleeding
+        # into every RMSNorm in the engine (input_layernorm,
+        # post_attention_layernorm, k_norm, q_norm, ...) — most of those
+        # don't see non-contig input and the wrap was wasted work.
+        for module in self.modules():
+            attn = getattr(module, "self_attn", None)
+            if attn is None:
+                continue
+            kva = getattr(attn, "kv_a_layernorm", None)
+            if kva is None:
+                continue
+            # If this layernorm has never been shimmed, wrap its forward.
+            if getattr(kva, "_attnres_kva_contig_shim", False):
+                continue
+            orig_forward = kva.forward
 
-            def forward_cuda_contig(self, x, residual=None, post_residual_addition=None):
-                if not x.is_contiguous():
-                    x = x.contiguous()
-                if residual is not None and not residual.is_contiguous():
-                    residual = residual.contiguous()
-                return orig(self, x, residual=residual, post_residual_addition=post_residual_addition)
+            def _make_shim(orig):
+                def shim(x, *a, **kw):
+                    if not x.is_contiguous():
+                        x = x.contiguous()
+                    return orig(x, *a, **kw)
+                return shim
 
-            RMSNorm.forward_cuda = forward_cuda_contig
-            RMSNorm._attnres_contiguous_patched = True
-            # Re-bind any already-instantiated RMSNorm modules' dispatch.
-            # ``MultiPlatformOp.__init__`` snapshots ``_forward_method`` to
-            # the class method at construction time, so existing instances
-            # still hold the un-patched bound method.
-            for mod in self.modules():
-                if isinstance(mod, RMSNorm):
-                    mod._forward_method = mod.forward_cuda
+            kva.forward = _make_shim(orig_forward)
+            kva._attnres_kva_contig_shim = True
 
 
 EntryClass = KimiBlockAttnResForCausalLM
