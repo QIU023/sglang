@@ -1,0 +1,819 @@
+# Copyright (c) Anthropic and contributors.
+# Licensed under the Apache License, Version 2.0 (see SGLang LICENSE).
+
+"""Block Attention Residual inference overlay for SGLang.
+
+Block AttnRes (Kimi paper § 5, Fig. 2) is a generic *residual-stream
+overlay*: it replaces a stock decoder's fixed pre-norm residual stream
+with a learned aggregation over a list of prior block representations
+plus the current partial block. The construct is in the same family as
+ByteDance's Hyper-Connections (arxiv 2409.19606) and DeepSeek's mHC
+(arxiv 2512.24880) — multi-stream residual variants — and is intended
+to be portable to any SGLang-supported decoder model.
+
+This file currently houses the **Kimi Linear specialisation**
+(:class:`KimiBlockAttnResForCausalLM`). When porting to other model
+families (Qwen3 MoE, DeepSeek-V3, BailingMoeLinear …), the intent is
+to extract :func:`block_attn_res`, :class:`KimiAttnResDecoderLayer.forward_attn_res`,
+and :class:`KimiBlockAttnResModel.forward` into a model-agnostic mixin
+sibling module under ``sglang.srt.layers.attn_res/``, and have each
+``XxxBlockAttnResForCausalLM`` be a thin wrapper. That refactor is
+deferred until a second model is integrated and the genuinely-shared
+shape vs Kimi-specific quirks separate cleanly.
+
+Forward flow (per layer)::
+
+    h = block_attn_res(blocks, partial_block, attn_res_proj, attn_res_norm)
+    if is_block_start: blocks.append(partial_block); partial_block = None
+    attn_out = self_attn(input_layernorm(h))
+    partial_block = attn_out if partial_block is None else partial_block + attn_out
+    h = block_attn_res(blocks, partial_block, mlp_res_proj, mlp_res_norm)
+    ffn_out = mlp(post_attention_layernorm(h))
+    partial_block = partial_block + ffn_out
+    -> (blocks, partial_block)
+
+KV cache, RadixCache, scheduler, and other serving-runtime concerns
+are inherited from upstream SGLang and not modified here. The
+research focus is the *parallelism* implementation (TP/PP/EP under
+inference) and its NCCL fabric pattern — not the serving stack.
+"""
+from __future__ import annotations
+
+from collections.abc import Iterable
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.models.kimi_linear import (
+    KimiDecoderLayer,
+    KimiLinearForCausalLM,
+    KimiLinearModel,
+)
+from sglang.srt.utils.common import BumpAllocator, add_prefix
+
+# Pure algorithm — sibling to ``sglang.srt.layers.mhc`` (DeepSeek-V4
+# Manifold-Constrained Hyper-Connections). Per-model wiring stays here.
+from sglang.srt.layers.attn_res import (
+    all_gather_seq,
+    block_attn_res,
+    block_attn_res_phase1,
+    block_attn_res_phase2_merge,
+    reduce_scatter_seq,
+    split_seq,
+    zero_init_pseudo_query,
+)
+
+import contextlib
+import os as _os
+
+
+_SEQ_SHARD_ENABLED = bool(int(_os.environ.get("SGLANG_ATTN_RES_SEQ_SHARD", "0")))
+
+
+@contextlib.contextmanager
+def _kimi_moe_no_op_all_reduce():
+    """Disable KimiMoE's hardcoded ``tensor_model_parallel_all_reduce``.
+
+    Upstream ``KimiMoE.forward`` (sglang/srt/models/kimi_linear.py) has a
+    hardcoded ``tensor_model_parallel_all_reduce(final_hidden_states)``
+    after experts + shared_experts merge. There is no flag to disable
+    it (unlike ``RowParallelLinear.reduce_results``).
+
+    For the seq-shard path we want the partial-sum output (so we can
+    reduce-scatter along seq dim). Swap the module-level binding to
+    identity for the duration of the wrapped call. Single-threaded
+    forward, so no concurrency concern.
+    """
+    import sglang.srt.models.kimi_linear as _kml
+    orig = _kml.tensor_model_parallel_all_reduce
+    _kml.tensor_model_parallel_all_reduce = lambda x: x
+    try:
+        yield
+    finally:
+        _kml.tensor_model_parallel_all_reduce = orig
+
+
+def _query_from_proj(proj: nn.Linear) -> torch.Tensor:
+    weight = proj.weight  # [1, D]
+    if hasattr(weight, "to_local"):
+        weight = weight.to_local()
+    return weight.squeeze(0)  # [D]
+
+
+def maybe_prefix(prefix: str, name: str) -> str:
+    """Compose ``prefix.name`` if prefix is non-empty, else ``name``.
+
+    Inlined from ``sglang.srt.models.transformers.maybe_prefix`` to avoid
+    importing the heavy transformers shim from a model module.
+    """
+    return name if not prefix else f"{prefix}.{name}"
+
+
+# Kept as a private alias so existing call sites in this file don't churn;
+# new code should call ``zero_init_pseudo_query`` directly.
+_zero_init = zero_init_pseudo_query
+
+
+# ---------------------------------------------------------------------------
+# AttnRes-wrapped decoder layer
+# ---------------------------------------------------------------------------
+
+
+class KimiAttnResDecoderLayer(KimiDecoderLayer):
+    """Decoder layer with Block AttnRes pre-attn and pre-FFN aggregations.
+
+    Inherits all sub-modules (``self_attn``, ``mlp``, layernorms) from
+    upstream :class:`KimiDecoderLayer`. Adds 4 small parameters:
+
+    * ``attn_res_proj`` — pseudo-query for pre-attention aggregation
+    * ``attn_res_norm`` — RMSNorm for keys in that aggregation
+    * ``mlp_res_proj``  — pseudo-query for pre-FFN aggregation
+    * ``mlp_res_norm``  — RMSNorm for keys in that aggregation
+
+    The pseudo-query projections are ``Linear(D, 1, bias=False)``;
+    their weight ``[1, D]`` IS the per-layer pseudo-query ``w_l``.
+    Replicated across TP (no sharding — they're tiny).
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        layer_idx: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        super().__init__(
+            config=config,
+            layer_idx=layer_idx,
+            quant_config=quant_config,
+            prefix=prefix,
+            alt_stream=alt_stream,
+        )
+        d = config.hidden_size
+        # Replicate across TP — these are O(D) parameters, not worth sharding.
+        self.attn_res_proj = ReplicatedLinear(
+            d, 1, bias=False, prefix=add_prefix("attn_res_proj", prefix),
+        )
+        self.mlp_res_proj = ReplicatedLinear(
+            d, 1, bias=False, prefix=add_prefix("mlp_res_proj", prefix),
+        )
+        self.attn_res_norm = RMSNorm(d, eps=config.rms_norm_eps)
+        self.mlp_res_norm = RMSNorm(d, eps=config.rms_norm_eps)
+        _zero_init(self.attn_res_proj)
+        _zero_init(self.mlp_res_proj)
+
+        # Seq-shard mode: disable in-projection all-reduce so the caller
+        # can reduce-scatter the partial sum along seq dim and run AttnRes
+        # Phase 2 + RMSNorm on the (T/P, D) shard. Mirrors the Zhihu
+        # blog's "reduce-scatter → 本地 merge → RMSNorm → all-gather" path.
+        if _SEQ_SHARD_ENABLED:
+            # KimiDelta + KimiMLA self_attn both use o_proj = RowParallelLinear.
+            self.self_attn.o_proj.reduce_results = False
+            # Dense layer 0 KimiMLP has down_proj = RowParallelLinear.
+            # KimiMoE doesn't expose a flag here (its AR is hardcoded);
+            # we handle it via a context manager around mlp() in the
+            # per-block forward.
+            mlp = self.mlp
+            if hasattr(mlp, "down_proj") and hasattr(mlp.down_proj, "reduce_results"):
+                mlp.down_proj.reduce_results = False
+            shared = getattr(mlp, "shared_experts", None)
+            if shared is not None and hasattr(shared, "down_proj") \
+                    and hasattr(shared.down_proj, "reduce_results"):
+                # KimiMoE.shared_experts also has its own down_proj that
+                # by default does an all-reduce that we'd double-count
+                # (since the parent KimiMoE then does another AR). The
+                # shared_experts is constructed with reduce_results=False
+                # by upstream already (line 122 of kimi_linear.py), so this
+                # is just defensive.
+                shared.down_proj.reduce_results = False
+
+    def _run_attn(
+        self,
+        attn_input: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        seq_shard: bool = False,
+    ) -> torch.Tensor:
+        """Single-arg layernorm + KimiDelta/MLA self-attention call.
+
+        Bypasses upstream's fused norm+residual path
+        (``input_layernorm(h, residual)`` which adds residual into normed-h)
+        because Block AttnRes replaces the residual stream.
+
+        When ``seq_shard=True``: ``attn_input`` is laid out as ``(T/P, D)``
+        per TP rank. Run RMSNorm locally on the shard, all-gather to
+        replicated for self_attn, then reduce-scatter the (partial-sum)
+        o_proj output back to ``(T/P, D)``. Requires
+        ``self.self_attn.o_proj.reduce_results=False`` to be set at __init__
+        so o_proj returns the partial sum.
+        """
+        if seq_shard:
+            attn_in_shard = self.input_layernorm(attn_input)
+            attn_in_replicated = all_gather_seq(attn_in_shard)
+            attn_out_partial = self.self_attn(
+                hidden_states=attn_in_replicated,
+                positions=positions,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+            )
+            return reduce_scatter_seq(attn_out_partial)
+
+        attn_in = self.input_layernorm(attn_input)
+        return self.self_attn(
+            hidden_states=attn_in,
+            positions=positions,
+            forward_batch=forward_batch,
+            zero_allocator=zero_allocator,
+        )
+
+    def _run_mlp(
+        self,
+        mlp_input: torch.Tensor,
+        seq_shard: bool = False,
+    ) -> torch.Tensor:
+        if seq_shard:
+            mlp_in_shard = self.post_attention_layernorm(mlp_input)
+            mlp_in_replicated = all_gather_seq(mlp_in_shard)
+            # KimiMoE has a hardcoded ``tensor_model_parallel_all_reduce``
+            # we have to noop. Dense KimiMLP has ``down_proj.reduce_results=False``
+            # set at __init__, so it just returns the partial sum.
+            if self.is_moe and getattr(self.mlp, "block_sparse_moe", None) is not None \
+                    or self.mlp.__class__.__name__ in ("KimiMoE", "block_sparse_moe"):
+                with _kimi_moe_no_op_all_reduce():
+                    mlp_partial = self.mlp(mlp_in_replicated)
+            else:
+                mlp_partial = self.mlp(mlp_in_replicated)
+            return reduce_scatter_seq(mlp_partial)
+
+        ffn_in = self.post_attention_layernorm(mlp_input)
+        return self.mlp(ffn_in)
+
+
+# ---------------------------------------------------------------------------
+# AttnRes model (replaces decoder layer iteration)
+# ---------------------------------------------------------------------------
+
+
+def _stack_blocks(block_list: list[torch.Tensor]) -> torch.Tensor:
+    """[N x (B,T,D)] -> (N, B, T, D). PP cross-stage transport format."""
+    if not block_list:
+        # Sentinel for stage 0: empty stack with correct trailing shape.
+        # The receiver detects len==0 and starts with empty list.
+        raise ValueError("Cannot stack empty block list — caller must guard.")
+    return torch.stack(block_list, dim=0)
+
+
+def _unstack_blocks(blocks: torch.Tensor) -> list[torch.Tensor]:
+    """(N, B, T, D) -> [N x (B,T,D)]."""
+    return [blocks[i] for i in range(blocks.shape[0])]
+
+
+class KimiBlockAttnResModel(KimiLinearModel):
+    """Model wrapper that threads the AttnRes block list through layers.
+
+    Replaces upstream ``KimiLinearModel.forward``'s residual flow with
+    Block AttnRes block-list flow. Layer construction (FSDP/TP/EP plumbing
+    is delegated to upstream's ``make_layers``) is identical except the
+    layer factory swaps in :class:`KimiAttnResDecoderLayer`.
+
+    PP transport: ``hidden_states`` carries the current ``partial_block``
+    and a stacked-blocks tensor under proxy key ``"blocks"`` is shipped
+    alongside; the last stage materializes the final aggregation +
+    norm head.
+    """
+
+    # Override the per-layer constructor used by ``make_layers``.
+    _DECODER_LAYER_CLS = KimiAttnResDecoderLayer
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        # Call grandparent (nn.Module) __init__, then re-build sub-modules
+        # with our layer class. Re-implementing the parent body here is
+        # cleaner than monkey-patching ``make_layers`` mid-flight.
+        nn.Module.__init__(self)
+        from sglang.srt.utils import make_layers
+        from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.pp_group = get_pp_group()
+
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+
+        self.alt_stream = torch.cuda.Stream()
+
+        self.layers, self.start_layer, self.end_layer = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: self._DECODER_LAYER_CLS(
+                config=config,
+                layer_idx=idx,
+                quant_config=quant_config,
+                prefix=prefix,
+                alt_stream=self.alt_stream,
+            ),
+            pp_rank=self.pp_group.rank_in_group,
+            pp_size=self.pp_group.world_size,
+            prefix=f"{prefix}.layers",
+        )
+
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            d = config.hidden_size
+            # Final aggregation (post-last-layer): same shape as per-layer
+            # AttnRes, used once before the final norm + lm_head.
+            self.final_attn_res_proj = ReplicatedLinear(
+                d, 1, bias=False, prefix=f"{prefix}.final_attn_res_proj",
+            )
+            self.final_attn_res_norm = RMSNorm(d, eps=config.rms_norm_eps)
+            _zero_init(self.final_attn_res_proj)
+        else:
+            self.norm = PPMissingLayer()
+            self.final_attn_res_proj = None
+            self.final_attn_res_norm = None
+
+        world_size = get_tensor_model_parallel_world_size()
+        assert (
+            config.num_attention_heads % world_size == 0
+        ), "num_attention_heads must be divisible by world_size"
+
+        # Block boundary detection (Kimi paper: layer_idx % layers_per_block == 0).
+        n_blocks = getattr(config, "attn_res_num_blocks", 4)
+        self.layers_per_block = max(1, config.num_hidden_layers // n_blocks)
+
+    def _seq_shard_active(self, partial_block: torch.Tensor) -> bool:
+        """Decide whether seq-dim sharding can be safely used this forward.
+
+        Three conditions must hold:
+        1. ``SGLANG_ATTN_RES_SEQ_SHARD=1`` env var was set at module load.
+        2. TP world size > 1 (else nothing to shard across).
+        3. ``num_tokens % tp_size == 0`` (decode with batch size 1 has
+           ``num_tokens=1`` which is not divisible — fall back to replicated).
+        """
+        if not _SEQ_SHARD_ENABLED:
+            return False
+        from sglang.srt.distributed import get_tensor_model_parallel_world_size
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size == 1:
+            return False
+        if partial_block.shape[0] % tp_size != 0:
+            return False
+        return True
+
+    def _forward_one_block(
+        self,
+        committed_blocks: list[torch.Tensor],
+        partial_block: torch.Tensor,
+        layers_in_block: list,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        seq_shard: bool = False,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Two-phase optimized forward over a full block of layers.
+
+        Block-level commit semantics:
+        * Pre-attn aggregation of *layer 0* of this block uses the OLD
+          committed list (length B-1) and the previous block's final
+          partial. This is the "block-boundary first aggregation".
+        * Then commit happens (committed grows to length B; partial = None).
+        * The remaining 2·L_block - 1 aggregations (layer 0's pre-FFN
+          and all layer 1+ pre-attn / pre-FFN) all use the NEW committed
+          list (length B) — these can share one Phase 1 pass.
+        """
+        L0 = layers_in_block[0]
+
+        # ---- Aggregation 1/2L_block: layer 0's pre-attn (OLD committed) ----
+        if committed_blocks:
+            cache0 = block_attn_res_phase1(
+                committed_blocks,
+                [_query_from_proj(L0.attn_res_proj)],
+                [L0.attn_res_norm],
+            )[0]
+        else:
+            cache0 = None  # Block 0 entry: identity on partial_block.
+        h = block_attn_res_phase2_merge(
+            cache0,
+            partial_block,
+            _query_from_proj(L0.attn_res_proj),
+            L0.attn_res_norm,
+        )
+
+        # ---- Commit at block start ----
+        committed_blocks = committed_blocks + [partial_block]
+        # partial_block becomes self_attn(input_layernorm(h)) below.
+
+        # ---- Phase 1 batched against NEW committed list, for the
+        #      2·L_block - 1 remaining queries within this block ----
+        rest_queries: list[torch.Tensor] = []
+        rest_norms: list = []
+        rest_queries.append(_query_from_proj(L0.mlp_res_proj))
+        rest_norms.append(L0.mlp_res_norm)
+        for L in layers_in_block[1:]:
+            rest_queries.extend([
+                _query_from_proj(L.attn_res_proj),
+                _query_from_proj(L.mlp_res_proj),
+            ])
+            rest_norms.extend([L.attn_res_norm, L.mlp_res_norm])
+        rest_cache = block_attn_res_phase1(
+            committed_blocks, rest_queries, rest_norms,
+        )
+
+        cache_idx = 0
+
+        # ---- Layer 0 attn + post-attn aggregation ----
+        attn_out = L0._run_attn(
+            h, positions, forward_batch, zero_allocator, seq_shard=seq_shard,
+        )
+        partial_block = attn_out
+
+        h = block_attn_res_phase2_merge(
+            rest_cache[cache_idx], partial_block,
+            rest_queries[cache_idx], rest_norms[cache_idx],
+        )
+        cache_idx += 1
+        ffn_out = L0._run_mlp(h, seq_shard=seq_shard)
+        partial_block = partial_block + ffn_out
+
+        # ---- Layers 1..L_block-1 ----
+        for L in layers_in_block[1:]:
+            # Pre-attn
+            h = block_attn_res_phase2_merge(
+                rest_cache[cache_idx], partial_block,
+                rest_queries[cache_idx], rest_norms[cache_idx],
+            )
+            cache_idx += 1
+            attn_out = L._run_attn(
+                h, positions, forward_batch, zero_allocator, seq_shard=seq_shard,
+            )
+            partial_block = partial_block + attn_out
+            # Pre-FFN
+            h = block_attn_res_phase2_merge(
+                rest_cache[cache_idx], partial_block,
+                rest_queries[cache_idx], rest_norms[cache_idx],
+            )
+            cache_idx += 1
+            ffn_out = L._run_mlp(h, seq_shard=seq_shard)
+            partial_block = partial_block + ffn_out
+
+        return committed_blocks, partial_block
+
+    def _naive_per_layer_step(
+        self,
+        blocks: list[torch.Tensor],
+        partial_block: torch.Tensor,
+        layer,
+        is_block_start: bool,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Fallback path when this PP stage isn't block-aligned."""
+        h = block_attn_res(blocks, partial_block, layer.attn_res_proj, layer.attn_res_norm)
+        if is_block_start:
+            blocks = blocks + [partial_block]
+            partial_block = None
+        attn_out = layer._run_attn(h, positions, forward_batch, zero_allocator)
+        partial_block = attn_out if partial_block is None else partial_block + attn_out
+        h = block_attn_res(blocks, partial_block, layer.mlp_res_proj, layer.mlp_res_norm)
+        ffn_out = layer._run_mlp(h)
+        partial_block = partial_block + ffn_out
+        return blocks, partial_block
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> torch.Tensor:
+        # First-stage init.
+        if self.pp_group.is_first_rank:
+            if inputs_embeds is not None:
+                h = inputs_embeds
+            else:
+                h = self.embed_tokens(input_ids)
+            block_list: list[torch.Tensor] = []
+            partial_block = h
+        else:
+            assert pp_proxy_tensors is not None
+            partial_block = pp_proxy_tensors["hidden_states"]
+            # PPProxyTensors implements ``__getitem__`` but no ``.get()``;
+            # peek via the underlying ``.tensors`` dict.
+            blocks_t = pp_proxy_tensors.tensors.get("blocks")
+            block_list = (
+                _unstack_blocks(blocks_t)
+                if (blocks_t is not None and blocks_t.shape[0] > 0)
+                else []
+            )
+
+        zero_allocator = BumpAllocator(
+            buffer_size=1024,
+            dtype=torch.float32,
+            device=partial_block.device,
+        )
+
+        # Iterate this stage's slice in ``layers_per_block``-sized chunks.
+        # Within each chunk run ONE Phase 1 against the (constant-within-block)
+        # committed list, then per-layer Phase 2 merges. This is the
+        # algorithmic IO saving from the Zhihu blog
+        # (https://zhuanlan.zhihu.com/p/2017528295286133070):
+        # naive  = O(2·L_block · N · T · D) committed-block reads per block
+        # 2-phase = O(N · T · D + 2·L_block · T · D) per block
+        # (factor ≈ L_block reduction at large N)
+        L_block = self.layers_per_block
+        layer_indices = list(range(self.start_layer, self.end_layer))
+
+        # PP slicing assumption: this stage's layer range is block-aligned
+        # (i.e. ``start_layer`` is a block boundary and ``end_layer - start_layer``
+        # is a multiple of L_block). Holds for our num_blocks=4 configs at
+        # PP up to 4. If a future config violates this, fall back to per-layer
+        # naive aggregation for the partial-block on this stage.
+        block_aligned = (
+            len(layer_indices) > 0
+            and layer_indices[0] % L_block == 0
+            and len(layer_indices) % L_block == 0
+        )
+
+        # Decide seq-shard layout for this forward call. If active, the
+        # ENTRY partial_block needs to be split along seq dim to (T/P, D);
+        # the committed_blocks coming through pp_proxy_tensors are
+        # likewise sharded if the previous stage was in seq-shard mode.
+        seq_shard_active = self._seq_shard_active(partial_block)
+
+        if seq_shard_active and self.pp_group.is_first_rank:
+            # First PP rank: input came from embed_tokens which is replicated.
+            # Split → shard. (Subsequent stages receive already-sharded
+            # tensors via pp_proxy_tensors, so no split needed.)
+            partial_block = split_seq(partial_block)
+
+        if block_aligned:
+            for chunk_start in range(0, len(layer_indices), L_block):
+                chunk = layer_indices[chunk_start : chunk_start + L_block]
+                layers_in_block = [self.layers[i] for i in chunk]
+                block_list, partial_block = self._forward_one_block(
+                    block_list,
+                    partial_block,
+                    layers_in_block,
+                    positions,
+                    forward_batch,
+                    zero_allocator,
+                    seq_shard=seq_shard_active,
+                )
+        else:
+            # Fallback: naive per-layer aggregation across this PP stage.
+            # Naive path doesn't currently support seq-shard — gather first.
+            if seq_shard_active:
+                partial_block = all_gather_seq(partial_block)
+                block_list = [all_gather_seq(b) for b in block_list]
+                seq_shard_active = False
+            for global_idx in layer_indices:
+                layer = self.layers[global_idx]
+                is_block_start = (global_idx % L_block == 0)
+                block_list, partial_block = self._naive_per_layer_step(
+                    block_list, partial_block, layer, is_block_start,
+                    positions, forward_batch, zero_allocator,
+                )
+
+        if not self.pp_group.is_last_rank:
+            # Send (partial_block, blocks) to next PP stage.
+            blocks_to_send = (
+                _stack_blocks(block_list) if block_list
+                else partial_block.new_zeros((0, *partial_block.shape))
+            )
+            return PPProxyTensors(
+                {"hidden_states": partial_block, "blocks": blocks_to_send}
+            )
+
+        # Last stage: final aggregation + norm.
+        # Both ``block_attn_res`` (per-token softmax-aggregator) and
+        # ``self.norm`` (per-token RMSNorm) commute with seq-dim sharding,
+        # so they run correctly on (T/P, D) shards. The final ``all_gather``
+        # restores (T, D) replicated for the lm_head.
+        h_final = block_attn_res(
+            block_list, partial_block,
+            self.final_attn_res_proj, self.final_attn_res_norm,
+        )
+        h_normed = self.norm(h_final)
+        if seq_shard_active:
+            h_normed = all_gather_seq(h_normed)
+        return h_normed
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry: KimiBlockAttnResForCausalLM
+# ---------------------------------------------------------------------------
+
+
+class KimiBlockAttnResForCausalLM(KimiLinearForCausalLM):
+    """Causal-LM head wrapping :class:`KimiBlockAttnResModel`.
+
+    Inherits ``forward`` and ``load_weights`` from upstream — both work
+    as-is because:
+
+    * ``forward`` calls ``self.model(...)`` which is now AttnRes-aware.
+    * ``load_weights`` walks ``named_parameters()``, which now includes
+      the AttnRes-specific params (``attn_res_proj.weight``,
+      ``attn_res_norm.weight``, ``mlp_res_proj.weight``,
+      ``mlp_res_norm.weight``, ``final_attn_res_proj.weight``,
+      ``final_attn_res_norm.weight``) and matches them to keys with
+      the same names in the HF safetensors (see
+      ``phase10/dcp_to_hf_kimi_attn_res.py`` for the conversion).
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        # Skip upstream KimiLinearForCausalLM.__init__'s self.model
+        # construction — we want our AttnRes model class instead — and
+        # call grandparent (nn.Module) __init__ directly.
+        nn.Module.__init__(self)
+        self.config = config
+        self.quant_config = quant_config
+        self.model = KimiBlockAttnResModel(
+            config, quant_config, prefix=maybe_prefix(prefix, "model"),
+        )
+        self.pp_group = get_pp_group()
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
+        logit_scale = getattr(self.config, "logit_scale", 1.0)
+        self.logits_processor = LogitsProcessor(config=config, logit_scale=logit_scale)
+
+        # Patch fp32-required params that upstream constructs with the
+        # default torch dtype (bf16 under the engine's load context).
+        # See ``_force_fp32_required_params`` for context.
+        self._force_fp32_required_params()
+
+    def load_weights(self, weights):
+        """Filter PP-missing weights before delegating to upstream.
+
+        Under PP > 1, this rank only owns ``layers[start_layer:end_layer)``
+        and a subset of the top-level params (``embed_tokens`` only on
+        the first PP rank; ``norm``, ``lm_head``, ``final_attn_res_*``
+        only on the last). Upstream ``KimiLinearForCausalLM.load_weights``
+        looks up every weight name in ``params_dict`` and raises
+        ``KeyError`` for the missing ones — the
+        ``is_pp_missing_parameter`` helper in upstream is incomplete.
+
+        We pre-filter the weights iterator so missing-on-this-rank
+        entries are silently dropped, keeping upstream's load logic
+        unchanged for everything else.
+        """
+        is_first = self.pp_group.is_first_rank
+        is_last = self.pp_group.is_last_rank
+        start = self.model.start_layer
+        end = self.model.end_layer
+
+        last_only_top = (
+            "model.norm.weight",
+            "lm_head.weight",
+            "model.final_attn_res_proj.weight",
+            "model.final_attn_res_norm.weight",
+        )
+        first_only_top = ("model.embed_tokens.weight",)
+
+        def _filter():
+            for entry in weights:
+                name = entry[0]
+                # Top-level PP-stage filtering.
+                if name in last_only_top and not is_last:
+                    continue
+                if name in first_only_top and not is_first:
+                    continue
+                # Layer-range filtering.
+                if name.startswith("model.layers."):
+                    rest = name[len("model.layers.") :]
+                    idx_str, _, _ = rest.partition(".")
+                    try:
+                        idx = int(idx_str)
+                    except ValueError:
+                        yield entry
+                        continue
+                    if idx < start or idx >= end:
+                        continue
+                yield entry
+
+        # Upstream's load_weights post-loop iterates
+        # ``self.config.full_attention_layer_ids`` to materialise the
+        # MLA ``w_kc`` / ``w_vc`` cached projections per full-attn
+        # layer. Out-of-range layers on this PP rank are
+        # ``PPMissingLayer`` objects with no ``self_attn`` attribute,
+        # so the loop AttributeErrors. Temporarily shadow the
+        # config's ``full_attention_layer_ids`` property with an
+        # in-range subset for the duration of the upstream call,
+        # then restore.
+        cfg_cls = type(self.config)
+        in_range_full_attn = [
+            i for i in self.config.full_attention_layer_ids
+            if start <= i < end
+        ]
+        orig_prop = cfg_cls.__dict__.get("full_attention_layer_ids")
+        cfg_cls.full_attention_layer_ids = property(
+            lambda _self, _v=in_range_full_attn: _v
+        )
+        try:
+            return super().load_weights(_filter())
+        finally:
+            if orig_prop is not None:
+                cfg_cls.full_attention_layer_ids = orig_prop
+            else:
+                delattr(cfg_cls, "full_attention_layer_ids")
+
+    def _force_fp32_required_params(self) -> None:
+        """Apply post-construction compatibility patches to make this
+        non-mainline model class run under upstream's stock kernels.
+
+        Two patches:
+
+        1. ``e_score_correction_bias`` → fp32. Upstream ``KimiMoE.__init__``
+           (sglang/srt/models/kimi_linear.py) sets ``self.gate.e_score_correction_bias
+           = nn.Parameter(torch.empty(num_experts))`` with no dtype kwarg.
+           The downstream ``biased_grouped_topk_gpu`` path
+           (sglang/srt/layers/moe/topk.py:842) casts ``gating_output`` to
+           fp32 before the kernel call but passes the correction bias
+           unchanged; the sgl_kernel ``moe_fused_gate`` asserts both
+           dtypes match and crashes with "input and bias should have the
+           same dtype". Mutate in place via ``.data = ...`` because
+           ``TopK(correction_bias=self.gate.e_score_correction_bias)``
+           captures the original Parameter reference.
+
+        2. ``RMSNorm`` autopatch for non-contiguous input. MLA's
+           ``forward_absorb_prepare`` does
+           ``compressed_kv.split([kv_lora_rank, qk_rope_head_dim], dim=-1)``
+           which yields a non-contiguous ``k_nope`` view with
+           ``stride[0] = kv_lora_rank + qk_rope_head_dim``. Flashinfer's
+           rmsnorm requires ``stride[0]`` to be element-aligned to 8;
+           with our 436M dims (584 + 36 = 620), it isn't. Wrap
+           ``forward_cuda`` to ``.contiguous()`` non-contiguous inputs.
+        """
+        # Patch 1
+        for module in self.modules():
+            gate = getattr(module, "gate", None)
+            if gate is None:
+                continue
+            bias = getattr(gate, "e_score_correction_bias", None)
+            if bias is None or bias.dtype == torch.float32:
+                continue
+            bias.data = bias.data.to(torch.float32)
+
+        # Patch 2 — wrap RMSNorm.forward_cuda to enforce contiguous input.
+        from sglang.srt.layers.layernorm import RMSNorm
+        if not getattr(RMSNorm, "_attnres_contiguous_patched", False):
+            orig = RMSNorm.forward_cuda
+
+            def forward_cuda_contig(self, x, residual=None, post_residual_addition=None):
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                if residual is not None and not residual.is_contiguous():
+                    residual = residual.contiguous()
+                return orig(self, x, residual=residual, post_residual_addition=post_residual_addition)
+
+            RMSNorm.forward_cuda = forward_cuda_contig
+            RMSNorm._attnres_contiguous_patched = True
+            # Re-bind any already-instantiated RMSNorm modules' dispatch.
+            # ``MultiPlatformOp.__init__`` snapshots ``_forward_method`` to
+            # the class method at construction time, so existing instances
+            # still hold the un-patched bound method.
+            for mod in self.modules():
+                if isinstance(mod, RMSNorm):
+                    mod._forward_method = mod.forward_cuda
+
+
+EntryClass = KimiBlockAttnResForCausalLM
