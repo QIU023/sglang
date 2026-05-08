@@ -277,12 +277,28 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
             return reduce_scatter_seq(attn_out_partial)
 
         attn_in = self.input_layernorm(attn_input)
-        return self.self_attn(
+        attn_out = self.self_attn(
             hidden_states=attn_in,
             positions=positions,
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+        # When seq-shard is *enabled* but this forward call falls back to
+        # replicated (e.g. decode batch=1, num_tokens not divisible by TP),
+        # ``o_proj.reduce_results`` was permanently set to False at
+        # __init__, so the returned tensor is a TP-partial sum. We must
+        # all-reduce it ourselves to match the standard replicated
+        # output, otherwise downstream layers see a 1/P-magnitude attn
+        # contribution and the model silently drifts (softmax-invariant
+        # to scaling so generations look plausible but are wrong).
+        if _SEQ_SHARD_ENABLED:
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_world_size,
+                tensor_model_parallel_all_reduce,
+            )
+            if get_tensor_model_parallel_world_size() > 1:
+                attn_out = tensor_model_parallel_all_reduce(attn_out)
+        return attn_out
 
     def _run_mlp(
         self,
@@ -305,7 +321,24 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
             return reduce_scatter_seq(mlp_partial)
 
         ffn_in = self.post_attention_layernorm(mlp_input)
-        return self.mlp(ffn_in)
+        # Same correctness fix as _run_attn: when seq-shard env is set but
+        # this particular forward fell back to replicated, the dense
+        # ``down_proj.reduce_results=False`` (set at __init__) means MLP
+        # returns a partial sum. KimiMoE has a hardcoded AR in its forward
+        # which DOES still fire under seq_shard=False (because we don't
+        # invoke ``_kimi_moe_partial_sum``), so we only need to AR-fix the
+        # dense path.
+        if _is_kimi_moe(self.mlp):
+            return self.mlp(ffn_in)  # KimiMoE.forward did its own AR
+        mlp_out = self.mlp(ffn_in)
+        if _SEQ_SHARD_ENABLED:
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_world_size,
+                tensor_model_parallel_all_reduce,
+            )
+            if get_tensor_model_parallel_world_size() > 1:
+                mlp_out = tensor_model_parallel_all_reduce(mlp_out)
+        return mlp_out
 
 
 # ---------------------------------------------------------------------------

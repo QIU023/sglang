@@ -175,11 +175,23 @@ class Qwen3AttnResDecoderLayer(Qwen3DecoderLayer):
             )
             return reduce_scatter_seq(attn_out_partial)
         attn_in = self.input_layernorm(attn_input)
-        return self.self_attn(
+        attn_out = self.self_attn(
             positions=positions,
             hidden_states=attn_in,
             forward_batch=forward_batch,
         )
+        # See attn_res_overlay.py for the rationale: seq-shard's
+        # ``o_proj.reduce_results=False`` patch sticks at __init__, so
+        # the fallback path here returns a partial sum that must be
+        # explicitly all-reduced to match vanilla.
+        if _SEQ_SHARD_ENABLED:
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_world_size,
+                tensor_model_parallel_all_reduce,
+            )
+            if get_tensor_model_parallel_world_size() > 1:
+                attn_out = tensor_model_parallel_all_reduce(attn_out)
+        return attn_out
 
     def _run_mlp(self, mlp_input: torch.Tensor, seq_shard: bool = False) -> torch.Tensor:
         if seq_shard:
@@ -188,7 +200,15 @@ class Qwen3AttnResDecoderLayer(Qwen3DecoderLayer):
             mlp_partial = self.mlp(ffn_in_replicated)  # down_proj.reduce_results=False
             return reduce_scatter_seq(mlp_partial)
         ffn_in = self.post_attention_layernorm(mlp_input)
-        return self.mlp(ffn_in)
+        mlp_out = self.mlp(ffn_in)
+        if _SEQ_SHARD_ENABLED:
+            from sglang.srt.distributed import (
+                get_tensor_model_parallel_world_size,
+                tensor_model_parallel_all_reduce,
+            )
+            if get_tensor_model_parallel_world_size() > 1:
+                mlp_out = tensor_model_parallel_all_reduce(mlp_out)
+        return mlp_out
 
 
 # ---------------------------------------------------------------------------
