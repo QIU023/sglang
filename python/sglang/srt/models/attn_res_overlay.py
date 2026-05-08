@@ -79,6 +79,19 @@ import os as _os
 
 
 _SEQ_SHARD_ENABLED = bool(int(_os.environ.get("SGLANG_ATTN_RES_SEQ_SHARD", "0")))
+# Bench-only toggles (NOT meant for end users):
+#   SGLANG_ATTN_RES_BYPASS=1     — skip every aggregation, run vanilla
+#                                  PreNorm. Gives a fair "no-AttnRes
+#                                  baseline" using the same overlay class
+#                                  + same ckpt + same env-compat patches,
+#                                  isolating purely the AttnRes cost.
+#   SGLANG_ATTN_RES_NAIVE_PATH=1 — force the naive per-layer aggregator
+#                                  (every layer reads every committed
+#                                  block) instead of the two-phase batched
+#                                  path. Lets the bench harness measure
+#                                  the two-phase IO-amortisation gain.
+_BYPASS_ATTN_RES = bool(int(_os.environ.get("SGLANG_ATTN_RES_BYPASS", "0")))
+_FORCE_NAIVE_PATH = bool(int(_os.environ.get("SGLANG_ATTN_RES_NAIVE_PATH", "0")))
 
 _logger = _logging.getLogger(__name__)
 
@@ -622,7 +635,43 @@ class KimiBlockAttnResModel(KimiLinearModel):
             # tensors via pp_proxy_tensors, so no split needed.)
             partial_block = split_seq(partial_block)
 
-        if block_aligned:
+        # Bench-only: SGLANG_ATTN_RES_BYPASS=1 disables AttnRes entirely
+        # (skip every aggregation, never commit blocks) and runs vanilla
+        # PreNorm. Gives a directly-comparable "no-AttnRes baseline" that
+        # uses this same model class + same ckpt + same env-compat patches
+        # — so any latency delta vs the AttnRes-active path isolates the
+        # cost of the AttnRes algorithm itself. The AttnRes-specific
+        # parameters (attn_res_proj/norm/...) sit unused in memory but
+        # don't impact step time. Not for end users.
+        if _BYPASS_ATTN_RES:
+            if seq_shard_active:
+                partial_block = all_gather_seq(partial_block)
+                seq_shard_active = False
+            for global_idx in layer_indices:
+                layer = self.layers[global_idx]
+                attn_out = layer._run_attn(
+                    partial_block, positions, forward_batch,
+                    zero_allocator, seq_shard=False,
+                )
+                partial_block = partial_block + attn_out
+                ffn_out = layer._run_mlp(partial_block, seq_shard=False)
+                partial_block = partial_block + ffn_out
+        elif _FORCE_NAIVE_PATH or not block_aligned:
+            # Bench-only naive path OR fallback when this PP stage isn't
+            # block-aligned. Naive path doesn't currently support seq-shard
+            # — gather first.
+            if seq_shard_active:
+                partial_block = all_gather_seq(partial_block)
+                block_list = [all_gather_seq(b) for b in block_list]
+                seq_shard_active = False
+            for global_idx in layer_indices:
+                layer = self.layers[global_idx]
+                is_block_start = (global_idx % L_block == 0)
+                block_list, partial_block = self._naive_per_layer_step(
+                    block_list, partial_block, layer, is_block_start,
+                    positions, forward_batch, zero_allocator,
+                )
+        else:
             for chunk_start in range(0, len(layer_indices), L_block):
                 chunk = layer_indices[chunk_start : chunk_start + L_block]
                 layers_in_block = [self.layers[i] for i in chunk]
@@ -634,20 +683,6 @@ class KimiBlockAttnResModel(KimiLinearModel):
                     forward_batch,
                     zero_allocator,
                     seq_shard=seq_shard_active,
-                )
-        else:
-            # Fallback: naive per-layer aggregation across this PP stage.
-            # Naive path doesn't currently support seq-shard — gather first.
-            if seq_shard_active:
-                partial_block = all_gather_seq(partial_block)
-                block_list = [all_gather_seq(b) for b in block_list]
-                seq_shard_active = False
-            for global_idx in layer_indices:
-                layer = self.layers[global_idx]
-                is_block_start = (global_idx % L_block == 0)
-                block_list, partial_block = self._naive_per_layer_step(
-                    block_list, partial_block, layer, is_block_start,
-                    positions, forward_batch, zero_allocator,
                 )
 
         if not self.pp_group.is_last_rank:
