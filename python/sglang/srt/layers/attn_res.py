@@ -244,6 +244,8 @@ def block_attn_res_phase2_merge(
     partial_block: torch.Tensor,
     query: torch.Tensor,
     norm: nn.Module,
+    *,
+    use_fused_kernel: bool = True,
 ) -> torch.Tensor:
     """Phase 2 — online-softmax merge of committed-side (Phase 1) with partial_block.
 
@@ -276,10 +278,26 @@ def block_attn_res_phase2_merge(
 
     committed_part, lse_committed = committed_cache
 
-    # Compute partial-side logit only — single (1, *) score vs naive
-    # (N+1, *) score in :func:`block_attn_res`. Flatten leading dims
-    # for sgl_kernel's 2D-only rmsnorm so cuda-graph capture cleanly
-    # routes the kernel.
+    # Fast path: fused Triton kernel (RMSNorm + logit + online merge in
+    # one pass). Implements the blog's "Phase 2 merge fuses with
+    # RMSNorm" claim. Falls back to torch when triton/CUDA unavailable
+    # or when ``use_fused_kernel=False`` is set explicitly (test path).
+    if (
+        use_fused_kernel
+        and partial_block.is_cuda
+        and committed_part.is_cuda
+        and _phase2_merge_norm_triton is not None
+    ):
+        weight = _extract_norm_weight(norm)
+        eps = getattr(norm, "eps", 1e-6)
+        if weight is not None:
+            return _phase2_merge_norm_triton(
+                committed_part, lse_committed,
+                partial_block, query, weight, float(eps),
+            )
+
+    # Reference torch path. Flatten leading dims for sgl_kernel's
+    # 2D-only rmsnorm so cuda-graph capture cleanly routes the kernel.
     leading_shape = partial_block.shape[:-1]
     K_partial = norm(
         partial_block.reshape(-1, partial_block.shape[-1])
@@ -484,3 +502,144 @@ def assert_two_phase_equivalent(
             f"two-phase divergence on query {i}: "
             f"max diff = {(naive - two_phase).abs().max().item():.2e}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Fused Triton kernel: RMSNorm + logit + online-softmax merge
+# ---------------------------------------------------------------------------
+# Implements the blog's "Phase 2 merge can fuse with RMSNorm and AR" claim
+# (https://zhuanlan.zhihu.com/p/2017528295286133070). One program per
+# (token) row computes:
+#
+#   K_partial = rmsnorm(partial_block, weight, eps)         # (D,)
+#   logit_partial = dot(query, K_partial)                   # scalar
+#   m = max(lse_committed, logit_partial)
+#   w_c = exp(lse_committed - m); w_p = exp(logit_partial - m)
+#   out = (w_c * committed_part + w_p * partial_block) / (w_c + w_p)
+#
+# Single read of partial_block (was 2: one through rmsnorm, one through
+# the merge weighting) and single read of committed_part. fp32 math
+# throughout, cast back to input dtype on store.
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _phase2_merge_norm_kernel(
+        committed_ptr,       # (M, D)
+        lse_ptr,             # (M,)
+        partial_ptr,         # (M, D)
+        query_ptr,           # (D,)
+        weight_ptr,          # (D,)
+        out_ptr,             # (M, D)
+        M, D,
+        stride_cm, stride_cd,
+        stride_pm, stride_pd,
+        stride_om, stride_od,
+        eps,
+        BLOCK_D: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        if pid >= M:
+            return
+
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < D
+
+        # Load partial row, fp32-promote.
+        partial_row = tl.load(
+            partial_ptr + pid * stride_pm + offs_d * stride_pd,
+            mask=mask_d, other=0.0,
+        )
+        out_dtype = partial_row.dtype
+        p_f32 = partial_row.to(tl.float32)
+
+        # RMSNorm: rsqrt(mean(x^2) + eps) * weight.
+        sumsq = tl.sum(p_f32 * p_f32, axis=0)
+        inv_rms = 1.0 / tl.sqrt(sumsq / D + eps)
+        weight = tl.load(weight_ptr + offs_d, mask=mask_d, other=0.0).to(tl.float32)
+        K_partial = p_f32 * inv_rms * weight    # (D,) fp32
+
+        # query · K_partial  →  scalar logit.
+        query = tl.load(query_ptr + offs_d, mask=mask_d, other=0.0).to(tl.float32)
+        logit_partial = tl.sum(query * K_partial, axis=0)
+
+        # Online-softmax merge.
+        lse_c = tl.load(lse_ptr + pid).to(tl.float32)
+        m_new = tl.maximum(lse_c, logit_partial)
+        w_c = tl.exp(lse_c - m_new)
+        w_p = tl.exp(logit_partial - m_new)
+        denom = w_c + w_p
+
+        # Read committed row.
+        committed_row = tl.load(
+            committed_ptr + pid * stride_cm + offs_d * stride_cd,
+            mask=mask_d, other=0.0,
+        ).to(tl.float32)
+
+        # Merge raw partial (NOT K_partial — RMSNorm is for the logit only).
+        out = (w_c * committed_row + w_p * p_f32) / denom
+        tl.store(
+            out_ptr + pid * stride_om + offs_d * stride_od,
+            out.to(out_dtype),
+            mask=mask_d,
+        )
+
+    def _phase2_merge_norm_triton(
+        committed_part: torch.Tensor,    # (*, D), input dtype
+        lse_committed: torch.Tensor,     # (*,), input dtype
+        partial_block: torch.Tensor,     # (*, D), input dtype
+        query: torch.Tensor,             # (D,), input dtype
+        weight: torch.Tensor,            # (D,), input dtype
+        eps: float,
+    ) -> torch.Tensor:
+        """Fused Phase-2 merge kernel. See module docstring."""
+        leading = partial_block.shape[:-1]
+        D = partial_block.shape[-1]
+        M = 1
+        for s in leading:
+            M *= s
+        committed_2d = committed_part.reshape(M, D).contiguous()
+        partial_2d = partial_block.reshape(M, D).contiguous()
+        lse_1d = lse_committed.reshape(M).contiguous()
+        out = torch.empty_like(partial_2d)
+
+        # Power-of-two BLOCK_D covering full D row.
+        BLOCK_D = 1
+        while BLOCK_D < D:
+            BLOCK_D *= 2
+
+        grid = (M,)
+        _phase2_merge_norm_kernel[grid](
+            committed_2d, lse_1d, partial_2d,
+            query.contiguous(), weight.contiguous(), out,
+            M, D,
+            committed_2d.stride(0), committed_2d.stride(1),
+            partial_2d.stride(0), partial_2d.stride(1),
+            out.stride(0), out.stride(1),
+            eps,
+            BLOCK_D=BLOCK_D,
+        )
+        return out.reshape(*leading, D)
+
+except ImportError:
+    _phase2_merge_norm_triton = None
+    _phase2_merge_norm_kernel = None
+
+
+def _extract_norm_weight(norm: nn.Module) -> Optional[torch.Tensor]:
+    """Pull the weight tensor from RMSNorm-shaped modules.
+
+    Supports:
+      * torch.nn.RMSNorm
+      * sglang.srt.layers.layernorm.RMSNorm
+      * the inline _PureTorchRMSNorm used in tests
+
+    All three expose ``.weight``. Returns None on unrecognised shapes
+    so caller falls back to torch path safely.
+    """
+    w = getattr(norm, "weight", None)
+    if isinstance(w, torch.Tensor) and w.ndim == 1:
+        return w
+    return None
