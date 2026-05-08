@@ -104,7 +104,11 @@ def block_attn_res(
       training overhead, no need to two-phase the training path).
     """
     V = torch.stack(blocks + [partial_block], dim=0)   # (N+1, *, D)
-    K = norm(V)
+    # SGLang's sgl_kernel rmsnorm is 2D-only (M, D). Flatten leading
+    # dims for the norm call (lets cuda-graph capture route the kernel
+    # cleanly), then restore shape for the einsum / weighted sum.
+    leading_shape = V.shape[:-1]
+    K = norm(V.reshape(-1, V.shape[-1])).reshape(*leading_shape, V.shape[-1])
     query = _query_from_proj(proj)                     # (D,)
     logits = torch.einsum("d, n...d -> n...", query, K)
     weights = F.softmax(logits, dim=0)
@@ -217,8 +221,12 @@ def block_attn_res_phase1(
     # which would happen if a downstream caller passes RMSNorms from
     # multiple model files with different defaults. Same math, slower.
     out: list[Optional[tuple[torch.Tensor, torch.Tensor]]] = []
+    leading_shape = V.shape[:-1]
     for q, norm in zip(queries, norms):
-        K = norm(V)                                                  # (N, *, D)
+        # Flatten leading dims for sgl_kernel's 2D-only rmsnorm.
+        K = norm(V.reshape(-1, V.shape[-1])).reshape(
+            *leading_shape, V.shape[-1]
+        )                                                            # (N, *, D)
         logits = torch.einsum("d, n...d -> n...", q, K)              # (N, *)
         m = logits.max(dim=0).values                                 # (*,)
         exp_l = torch.exp(logits - m.unsqueeze(0))                   # (N, *)
@@ -269,8 +277,13 @@ def block_attn_res_phase2_merge(
     committed_part, lse_committed = committed_cache
 
     # Compute partial-side logit only — single (1, *) score vs naive
-    # (N+1, *) score in :func:`block_attn_res`.
-    K_partial = norm(partial_block)                                  # (*, D)
+    # (N+1, *) score in :func:`block_attn_res`. Flatten leading dims
+    # for sgl_kernel's 2D-only rmsnorm so cuda-graph capture cleanly
+    # routes the kernel.
+    leading_shape = partial_block.shape[:-1]
+    K_partial = norm(
+        partial_block.reshape(-1, partial_block.shape[-1])
+    ).reshape(*leading_shape, partial_block.shape[-1])               # (*, D)
     logit_partial = torch.einsum("d, ...d -> ...", query, K_partial)  # (*,)
 
     # Max-stable online softmax merge.
