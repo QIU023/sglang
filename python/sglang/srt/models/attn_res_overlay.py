@@ -276,7 +276,21 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
             )
             return reduce_scatter_seq(attn_out_partial)
 
-        attn_in = self.input_layernorm(attn_input)
+        # Numerical-stability: when ATTNRES_FP32_NORM=1, RMSNorm the
+        # attn input in fp32 to avoid bf16 quantization of large outliers
+        # (Block AttnRes accumulates an unbounded residual stream which
+        # standard pre-norm transformers don't have, exposing bf16
+        # underflow in RMSNorm divisor for sparse-outlier inputs).
+        if _os.environ.get("ATTNRES_FP32_NORM", "0") == "1":
+            # Manual fp32 RMSNorm — sgl_kernel rmsnorm is bf16-only.
+            saved_dtype = attn_input.dtype
+            x = attn_input.to(torch.float32)
+            ln_w = self.input_layernorm.weight.to(torch.float32)
+            ln_eps = getattr(self.input_layernorm, "variance_epsilon", 1e-6)
+            rms = (x * x).mean(dim=-1, keepdim=True).add(ln_eps).rsqrt()
+            attn_in = (x * rms * ln_w).to(saved_dtype)
+        else:
+            attn_in = self.input_layernorm(attn_input)
         attn_out = self.self_attn(
             hidden_states=attn_in,
             positions=positions,
@@ -540,11 +554,48 @@ class KimiBlockAttnResModel(KimiLinearModel):
 
         cache_idx = 0
 
+        # Numerical-stability workaround for AttnRes residual stream
+        # accumulating to NaN at deep blocks. Two complementary knobs:
+        #   ATTNRES_BF16_ACCUM=1  → keep residual in bf16 (original)
+        #   default                → accumulate residual in fp32
+        #   ATTNRES_CLIP=N        → clamp partial_block to [-N, N] before
+        #                            each attn/mlp call; default 0 = off.
+        _fp32_accum = _os.environ.get("ATTNRES_BF16_ACCUM", "0") != "1"
+        _input_dtype = partial_block.dtype
+        if _fp32_accum:
+            partial_block = partial_block.to(torch.float32)
+        try:
+            _clip = float(_os.environ.get("ATTNRES_CLIP", "0"))
+        except Exception:
+            _clip = 0.0
+        def _maybe_clip(x):
+            if _clip <= 0:
+                return x
+            return x.clamp(min=-_clip, max=_clip)
+
+        _trace_fine = _os.environ.get("ATTNRES_NAN_TRACE", "0") == "1"
+        def _stats_pb(label):
+            if not _trace_fine:
+                return
+            t = partial_block
+            try:
+                nan = bool(t.isnan().any().item())
+                inf = bool(t.isinf().any().item())
+                am = float(t.detach().float().abs().mean().item())
+                amx = float(t.detach().float().abs().max().item())
+                _logger.warning(
+                    f"[NaN-FINE] {label}: abs_mean={am:.4f} "
+                    f"max={amx:.4f} nan={nan} inf={inf}"
+                )
+            except Exception as e:
+                _logger.warning(f"[NaN-FINE] {label}: {e}")
+
         # ---- Layer 0 attn + post-attn aggregation ----
         attn_out = L0._run_attn(
             h, positions, forward_batch, zero_allocator, seq_shard=seq_shard,
         )
         partial_block = attn_out
+        _stats_pb(f"L{layers_in_block[0].layer_id if hasattr(layers_in_block[0], "layer_id") else 0}_after_attn")
 
         h = block_attn_res_phase2_merge(
             rest_cache[cache_idx], partial_block,
@@ -553,19 +604,21 @@ class KimiBlockAttnResModel(KimiLinearModel):
         cache_idx += 1
         ffn_out = L0._run_mlp(h, seq_shard=seq_shard)
         partial_block = partial_block + ffn_out
+        _stats_pb(f"L{layers_in_block[0].layer_id if hasattr(layers_in_block[0], "layer_id") else 0}_after_mlp")
 
         # ---- Layers 1..L_block-1 ----
         for L in layers_in_block[1:]:
             # Pre-attn
             h = block_attn_res_phase2_merge(
-                rest_cache[cache_idx], partial_block,
+                rest_cache[cache_idx], _maybe_clip(partial_block).to(_input_dtype),
                 rest_queries[cache_idx], rest_norms[cache_idx],
             )
             cache_idx += 1
             attn_out = L._run_attn(
                 h, positions, forward_batch, zero_allocator, seq_shard=seq_shard,
             )
-            partial_block = partial_block + attn_out
+            partial_block = partial_block + attn_out.to(partial_block.dtype)
+            _stats_pb(f"L{L.layer_id if hasattr(L, "layer_id") else "?"}_after_attn")
             # Pre-FFN
             h = block_attn_res_phase2_merge(
                 rest_cache[cache_idx], partial_block,
@@ -574,6 +627,13 @@ class KimiBlockAttnResModel(KimiLinearModel):
             cache_idx += 1
             ffn_out = L._run_mlp(h, seq_shard=seq_shard)
             partial_block = partial_block + ffn_out
+            _stats_pb(f"L{L.layer_id if hasattr(L, "layer_id") else "?"}_after_mlp")
+
+        # Cast back to model dtype before returning so downstream code
+        # (committed_blocks scatter/stack, next block's RMSNorm, etc.)
+        # sees the original dtype.
+        if _fp32_accum:
+            partial_block = partial_block.to(_input_dtype)
 
         return committed_blocks, partial_block
 
@@ -608,12 +668,32 @@ class KimiBlockAttnResModel(KimiLinearModel):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # NaN tracing: set ATTNRES_NAN_TRACE=1 to log per-layer NaN.
+        _trace = _os.environ.get("ATTNRES_NAN_TRACE", "0") == "1"
+        def _stats(t, name):
+            if not _trace or t is None:
+                return
+            try:
+                nan = bool(t.isnan().any().item())
+                inf = bool(t.isinf().any().item())
+                am = float(t.detach().float().abs().mean().item())
+                amx = float(t.detach().float().abs().max().item())
+                _logger.warning(
+                    f"[NaN-TRACE] {name}: shape={tuple(t.shape)} "
+                    f"dtype={t.dtype} abs_mean={am:.4f} max={amx:.4f} "
+                    f"nan={nan} inf={inf}"
+                )
+            except Exception as e:
+                _logger.warning(f"[NaN-TRACE] {name}: {e}")
+
         # First-stage init.
         if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 h = inputs_embeds
+                _stats(h, "input_embeds")
             else:
                 h = self.embed_tokens(input_ids)
+                _stats(h, "embed_tokens")
             block_list: list[torch.Tensor] = []
             partial_block = h
         else:
@@ -717,6 +797,7 @@ class KimiBlockAttnResModel(KimiLinearModel):
                     zero_allocator,
                     seq_shard=seq_shard_active,
                 )
+                _stats(partial_block, f"after_block_chunk_{chunk_start}")
 
         if not self.pp_group.is_last_rank:
             # Send (partial_block, blocks) to next PP stage.
