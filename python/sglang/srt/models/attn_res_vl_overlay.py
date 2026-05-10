@@ -195,6 +195,30 @@ class KimiAttnResVLForConditionalGeneration(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
         )
+        # general_mm_embed_routine expects ``language_model.get_input_embeddings()``
+        # to return the token-embedding module. The upstream
+        # KimiLinearForCausalLM (our parent) does not yet implement
+        # this hook; bind it inline to avoid a separate upstream patch.
+        if not hasattr(self.language_model, "get_input_embeddings"):
+            _embed_tokens = self.language_model.model.embed_tokens
+            self.language_model.get_input_embeddings = lambda: _embed_tokens
+        # Also bind the input-embed kwarg alias the routine uses
+        # (``input_embeds`` vs the upstream ``inputs_embeds``).
+        if not hasattr(self.language_model, "_lm_forward_orig"):
+            self.language_model._lm_forward_orig = self.language_model.forward
+            def _forward_with_input_embeds_alias(
+                input_ids=None, positions=None, forward_batch=None,
+                input_embeds=None, inputs_embeds=None,
+                pp_proxy_tensors=None, **kw,
+            ):
+                if input_embeds is not None and inputs_embeds is None:
+                    inputs_embeds = input_embeds
+                return self.language_model._lm_forward_orig(
+                    input_ids=input_ids, positions=positions,
+                    forward_batch=forward_batch, inputs_embeds=inputs_embeds,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            self.language_model.forward = _forward_with_input_embeds_alias
 
         self.quant_config = quant_config
 
@@ -240,18 +264,28 @@ class KimiAttnResVLForConditionalGeneration(nn.Module):
             vision_out = self.vision_tower(pixel_values=pixel_values)
             vision_features = vision_out.last_hidden_state  # [B, N_vis, D_vis]
 
+        # Cast to projector's dtype (LM is bf16; vision_tower is fp32
+        # by default since it was loaded outside our default-dtype
+        # context). The projector weights are bf16 per __init__.
+        proj_dtype = next(self.mm_projector.parameters()).dtype
+        vision_features = vision_features.to(proj_dtype)
         B, N_vis, D_vis = vision_features.shape
         flat = vision_features.reshape(B * N_vis, D_vis)
         projected = self.mm_projector(flat)  # [B*N_vis, D_llm]
         return projected
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        """Default LLaVA-style padding: each multimodal token in
-        input_ids expands to the corresponding number of vision
-        feature slots. SGLang provides the standard pattern.
+        """Our processor already inserts ``[image_token_id] * num_vision_tokens``
+        at each ``<image>`` position in input_ids, so SGLang's standard
+        post-processing is a no-op for us.
+
+        The standard ``MultiModalityDataPaddingPatternMultimodalTokens``
+        pattern expects ``mm_items[i].offsets`` (the positions where
+        image tokens should be expanded to N feature slots). We don't
+        set offsets — instead we pre-expand at processor time. So just
+        return input_ids verbatim.
         """
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return input_ids
 
     # ------------------------------------------------------------------
     # forward + load
