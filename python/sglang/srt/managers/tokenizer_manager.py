@@ -2726,6 +2726,15 @@ def _get_processor_wrapper(server_args):
 
 
 def _determine_tensor_transport_mode(server_args: ServerArgs) -> TensorTransportMode:
+    # SGLANG_DISABLE_SHM_MM=1: force "default" CPU transport instead of
+    # "cuda_ipc"/SHM-backed multimodal payload IPC. SHM IPC races against
+    # Monarch's actor lifecycle (the spawned actor's resource_tracker
+    # unlinks /psm_xxx before SGLang's scheduler subprocess can open it).
+    # "default" inlines the tensor in the pickle — slower for large image
+    # batches but lifecycle-safe.
+    import os as _os
+    if _os.environ.get("SGLANG_DISABLE_SHM_MM", "0") == "1":
+        return "default"
     is_cross_node = server_args.dist_init_addr
 
     if is_cross_node:
