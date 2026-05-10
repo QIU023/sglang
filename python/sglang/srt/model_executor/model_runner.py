@@ -2231,6 +2231,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         config = self.model_config.hf_config
         if isinstance(config, KimiLinearConfig):
             return config
+        # VLM wrapping: KimiAttnResVLConfig embeds the LM config under
+        # .text_config. Without this unwrap, the HybridLinearAttnBackend
+        # is never set up and KDA layers crash with the wrong attn_backend.
+        text_cfg = getattr(config, "text_config", None)
+        if text_cfg is not None and isinstance(text_cfg, KimiLinearConfig):
+            return text_cfg
         return None
 
     def _get_linear_attn_registry_result(self):
