@@ -244,6 +244,99 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
                 # is just defensive.
                 shared.down_proj.reduce_results = False
 
+    def _is_mla_self_attn(self) -> bool:
+        """KimiDecoderLayer's self_attn is either KimiDelta (linear KDA)
+        or DeepseekV2AttentionMLA. Detect MLA by the projections it owns.
+        Cached on first call."""
+        cached = getattr(self, "_attnres_is_mla_cached", None)
+        if cached is not None:
+            return cached
+        sa = self.self_attn
+        is_mla = (
+            hasattr(sa, "kv_a_proj_with_mqa")
+            and hasattr(sa, "kv_b_proj")
+            and hasattr(sa, "kv_a_layernorm")
+        )
+        self._attnres_is_mla_cached = is_mla
+        return is_mla
+
+    def _mla_forward_fp32(
+        self,
+        attn_in: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Eager fp32 MLA forward — bypasses flashinfer_mla.
+
+        Reproduces ``forward_normal_prepare`` + manual SDPA + ``o_proj``,
+        but in fp32 throughout the score/softmax/value-mul. K/V are
+        recomputed every call from the current ``attn_in`` (covering the
+        full prefill window or the cache-replayed extend window). This
+        is correct for prefill; for *decode* with cached prefix on this
+        same MLA layer, we'd need our own KV cache — but rollouts in our
+        VLM GRPO use forward_batch.forward_mode == EXTEND (full prefix
+        re-encoded each rollout step is acceptable for short generations).
+
+        On Block AttnRes layer 16 (the deepest MLA), flashinfer_mla NaNs
+        on bf16 inputs with max~77; running this layer in fp32 fixes the
+        output without needing a retrain or full backend rewrite.
+        """
+        sa = self.self_attn
+        # Q projection. Our config has q_lora_rank=None, so q_proj is direct.
+        if getattr(sa, "q_lora_rank", None) is not None:
+            q_lora = sa.q_a_proj(attn_in)[0]
+            q_lora = sa.q_a_layernorm(q_lora)
+            q = sa.q_b_proj(q_lora)[0]
+        else:
+            q = sa.q_proj(attn_in)[0]
+        # [T, num_local_heads * qk_head_dim] -> [T, H, qk_head_dim]
+        q = q.view(-1, sa.num_local_heads, sa.qk_head_dim)
+
+        # KV path: kv_a_proj_with_mqa -> [T, kv_lora_rank + qk_rope_head_dim]
+        latent = sa.kv_a_proj_with_mqa(attn_in)[0]
+        kv_a, k_pe = latent.split(
+            [sa.kv_lora_rank, sa.qk_rope_head_dim], dim=-1
+        )
+        kv_a = sa.kv_a_layernorm(kv_a.contiguous())
+        # k_pe is shared across heads (MQA-style) -> add head dim.
+        k_pe = k_pe.unsqueeze(1)  # [T, 1, qk_rope_head_dim]
+
+        # Apply RoPE to q's PE half and to k_pe.
+        q_pe = q[..., sa.qk_nope_head_dim:]
+        if sa.rotary_emb is not None:
+            q_pe, k_pe = sa.rotary_emb(positions, q_pe, k_pe)
+        q[..., sa.qk_nope_head_dim:] = q_pe
+
+        # kv_b_proj: kv_a -> [T, num_local_heads * (qk_nope + v_head)]
+        kv = sa.kv_b_proj(kv_a)[0]
+        kv = kv.view(
+            -1, sa.num_local_heads, sa.qk_nope_head_dim + sa.v_head_dim
+        )
+        k_nope = kv[..., : sa.qk_nope_head_dim]
+        v = kv[..., sa.qk_nope_head_dim:]
+        # Build full K: cat(k_nope, k_pe broadcast across heads).
+        k_pe_h = k_pe.expand(-1, sa.num_local_heads, -1)
+        k = torch.cat([k_nope, k_pe_h], dim=-1)  # [T, H, qk_head_dim]
+
+        # SDPA in fp32. Need [B=1, H, T, D] layout for F.sdpa.
+        T = q.shape[0]
+        q4 = q.transpose(0, 1).unsqueeze(0).float()  # [1, H, T, qk_head_dim]
+        k4 = k.transpose(0, 1).unsqueeze(0).float()  # [1, H, T, qk_head_dim]
+        v4 = v.transpose(0, 1).unsqueeze(0).float()  # [1, H, T, v_head_dim]
+        # Use sa.scaling if present (handles MLA's RoPE-aware scale).
+        scale = getattr(sa, "scaling", 1.0 / (sa.qk_head_dim ** 0.5))
+        # SDPA expects either is_causal or a mask. Causal across the full
+        # extend window — accurate for prefill; for decode-with-prefix
+        # we'd need a custom mask, but rollouts use full re-encode.
+        attn_out = F.scaled_dot_product_attention(
+            q4, k4, v4, is_causal=True, scale=scale,
+        )  # [1, H, T, v_head_dim]
+        attn_out = attn_out.squeeze(0).transpose(0, 1).contiguous()
+        attn_out = attn_out.to(attn_in.dtype)
+        attn_out = attn_out.reshape(T, sa.num_local_heads * sa.v_head_dim)
+        out, _ = sa.o_proj(attn_out)
+        return out
+
     def _run_attn(
         self,
         attn_input: torch.Tensor,
@@ -281,8 +374,14 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
         # (Block AttnRes accumulates an unbounded residual stream which
         # standard pre-norm transformers don't have, exposing bf16
         # underflow in RMSNorm divisor for sparse-outlier inputs).
+        # ATTNRES_INPUT_CLAMP=N: hard-clamp the post-RMSNorm attn input
+        # to [-N, N] before flashinfer_mla. flashinfer_mla NaNs on
+        # high-magnitude bf16 inputs at deep blocks (RTX 5090 SM 12.0
+        # has no working alternative MLA backend). Clamping matches
+        # what RMSNorm DID succeed at producing in earlier blocks
+        # (max ~5-50) and prevents the deepest layer from triggering
+        # the flashinfer_mla internal overflow.
         if _os.environ.get("ATTNRES_FP32_NORM", "0") == "1":
-            # Manual fp32 RMSNorm — sgl_kernel rmsnorm is bf16-only.
             saved_dtype = attn_input.dtype
             x = attn_input.to(torch.float32)
             ln_w = self.input_layernorm.weight.to(torch.float32)
@@ -291,6 +390,23 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
             attn_in = (x * rms * ln_w).to(saved_dtype)
         else:
             attn_in = self.input_layernorm(attn_input)
+
+        # ATTNRES_MLA_FP32_FALLBACK=1: bypass flashinfer_mla on every MLA
+        # layer. Block AttnRes residuals grow to max~77 by the deepest MLA
+        # layer; flashinfer_mla's bf16 internals overflow to NaN on Blackwell
+        # (RTX 5090 SM 12.0). Eager fp32 SDPA for these layers fixes
+        # correctness. We deliberately do NOT gate on a magnitude threshold
+        # because that requires a `.item()` host-sync which breaks cuda-graph
+        # capture; just always-fp32 when the flag is set (cost: ~1.5× MLA
+        # latency for our 4 MLA layers, acceptable for research/RL rollout).
+        if (
+            _os.environ.get("ATTNRES_MLA_FP32_FALLBACK", "0") == "1"
+            and self._is_mla_self_attn()
+        ):
+            return self._mla_forward_fp32(
+                attn_in, positions, forward_batch
+            )
+
         attn_out = self.self_attn(
             hidden_states=attn_in,
             positions=positions,
