@@ -298,6 +298,22 @@ class KimiAttnResVLForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
     ):
+        # SGLang's piecewise CUDA graph runner explicitly disables
+        # itself when ``forward_batch.input_embeds is not None`` (see
+        # ``piecewise_cuda_graph_runner.py:can_run`` with TODO(yuwei)).
+        # That path is what sets up the global ``_forward_context``,
+        # which KDA's ``RadixLinearAttention.forward`` consults to
+        # decide between the (mixed_qkv, a, b) helper and the standard
+        # ``AttentionBackend.forward(q, k, v)``. With no piecewise
+        # context, KDA falls to the wrong branch and crashes.
+        #
+        # Workaround: wrap the multimodal embed routine in a
+        # ``set_forward_context`` block ourselves. KDA only needs
+        # the context to be non-None for its IF gate; the contents
+        # don't matter for the unified_linear_attention_with_output
+        # path. Pass empty lists for attention/moe layers — those
+        # are only consumed by piecewise-cuda-graph capture, which
+        # is already off here.
         return general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
