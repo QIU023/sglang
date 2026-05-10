@@ -266,20 +266,23 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        """Eager fp32 MLA forward — bypasses flashinfer_mla.
+        """Eager fp32 MLA forward (EXTEND/prefill mode only).
 
         Reproduces ``forward_normal_prepare`` + manual SDPA + ``o_proj``,
-        but in fp32 throughout the score/softmax/value-mul. K/V are
-        recomputed every call from the current ``attn_in`` (covering the
-        full prefill window or the cache-replayed extend window). This
-        is correct for prefill; for *decode* with cached prefix on this
-        same MLA layer, we'd need our own KV cache — but rollouts in our
-        VLM GRPO use forward_batch.forward_mode == EXTEND (full prefix
-        re-encoded each rollout step is acceptable for short generations).
+        with score/softmax/value-mul in fp32. Writes the post-norm
+        ``kv_a`` and post-RoPE ``k_pe`` to SGLang's MLA KV buffer in the
+        same format flashinfer_mla expects, so subsequent **decode** steps
+        pull these correct K/V from cache and run native flashinfer_mla
+        on top — bf16 decode is numerically OK because per-step ``attn_in``
+        is one token (magnitudes don't accumulate the way prefill's do).
 
-        On Block AttnRes layer 16 (the deepest MLA), flashinfer_mla NaNs
-        on bf16 inputs with max~77; running this layer in fp32 fixes the
-        output without needing a retrain or full backend rewrite.
+        On Block AttnRes layer 16 (the deepest MLA), flashinfer_mla bf16
+        NaNs on prefill inputs with max~77; running prefill in fp32 fixes
+        the cached K/V; native bf16 decode then attends against good
+        cache → coherent generations end-to-end.
+
+        Caller invariant: only call when forward_batch.forward_mode is
+        an EXTEND-like mode. DECODE calls go through self_attn directly.
         """
         sa = self.self_attn
         # Q projection. Our config has q_lora_rank=None, so q_proj is direct.
@@ -294,18 +297,27 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
 
         # KV path: kv_a_proj_with_mqa -> [T, kv_lora_rank + qk_rope_head_dim]
         latent = sa.kv_a_proj_with_mqa(attn_in)[0]
-        kv_a, k_pe = latent.split(
+        kv_a_raw, k_pe_raw = latent.split(
             [sa.kv_lora_rank, sa.qk_rope_head_dim], dim=-1
         )
-        kv_a = sa.kv_a_layernorm(kv_a.contiguous())
+        kv_a = sa.kv_a_layernorm(kv_a_raw.contiguous())
         # k_pe is shared across heads (MQA-style) -> add head dim.
-        k_pe = k_pe.unsqueeze(1)  # [T, 1, qk_rope_head_dim]
+        k_pe = k_pe_raw.unsqueeze(1)  # [T, 1, qk_rope_head_dim]
 
-        # Apply RoPE to q's PE half and to k_pe.
+        # Apply RoPE to q's PE half and to k_pe (in-place on q_pe slice
+        # mirrors forward_normal_prepare).
         q_pe = q[..., sa.qk_nope_head_dim:]
         if sa.rotary_emb is not None:
             q_pe, k_pe = sa.rotary_emb(positions, q_pe, k_pe)
         q[..., sa.qk_nope_head_dim:] = q_pe
+
+        # Write post-norm kv_a + post-RoPE k_pe to SGLang's MLA KV buffer.
+        # Same layout as forward_normal_prepare so a later decode step
+        # using native flashinfer_mla absorb-path reads compatible cache.
+        latent_cache = torch.cat(
+            [kv_a.unsqueeze(1), k_pe], dim=-1
+        )  # [T, 1, kv_lora_rank + qk_rope_head_dim]
+        sa._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
 
         # kv_b_proj: kv_a -> [T, num_local_heads * (qk_nope + v_head)]
         kv = sa.kv_b_proj(kv_a)[0]
@@ -323,11 +335,10 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
         q4 = q.transpose(0, 1).unsqueeze(0).float()  # [1, H, T, qk_head_dim]
         k4 = k.transpose(0, 1).unsqueeze(0).float()  # [1, H, T, qk_head_dim]
         v4 = v.transpose(0, 1).unsqueeze(0).float()  # [1, H, T, v_head_dim]
-        # Use sa.scaling if present (handles MLA's RoPE-aware scale).
         scale = getattr(sa, "scaling", 1.0 / (sa.qk_head_dim ** 0.5))
-        # SDPA expects either is_causal or a mask. Causal across the full
-        # extend window — accurate for prefill; for decode-with-prefix
-        # we'd need a custom mask, but rollouts use full re-encode.
+        # Causal mask is correct for EXTEND-only calls (each token in the
+        # extend window attends to itself + prior extend tokens). Decode
+        # uses native flashinfer_mla which handles the prefix-mask itself.
         attn_out = F.scaled_dot_product_attention(
             q4, k4, v4, is_causal=True, scale=scale,
         )  # [1, H, T, v_head_dim]
@@ -391,17 +402,22 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
         else:
             attn_in = self.input_layernorm(attn_input)
 
-        # ATTNRES_MLA_FP32_FALLBACK=1: bypass flashinfer_mla on every MLA
-        # layer. Block AttnRes residuals grow to max~77 by the deepest MLA
-        # layer; flashinfer_mla's bf16 internals overflow to NaN on Blackwell
-        # (RTX 5090 SM 12.0). Eager fp32 SDPA for these layers fixes
-        # correctness. We deliberately do NOT gate on a magnitude threshold
-        # because that requires a `.item()` host-sync which breaks cuda-graph
-        # capture; just always-fp32 when the flag is set (cost: ~1.5× MLA
-        # latency for our 4 MLA layers, acceptable for research/RL rollout).
+        # ATTNRES_MLA_FP32_FALLBACK=1: bypass flashinfer_mla on MLA layers
+        # **during EXTEND/prefill only**. Block AttnRes residuals grow to
+        # max~77 by the deepest MLA layer; flashinfer_mla's bf16 internals
+        # overflow to NaN at prefill on Blackwell (RTX 5090 SM 12.0).
+        # The fp32 path writes correct ``kv_a + k_pe`` to SGLang's MLA KV
+        # buffer in the format flashinfer expects, so subsequent decode
+        # steps fetch good cached K/V and run native bf16 flashinfer_mla
+        # without NaN (per-step decode input is 1 token; bf16 kernels
+        # don't fail on the small magnitudes there).
+        #
+        # No host-CPU sync (.item()) — cuda graph capture stays valid
+        # because forward_mode is known at trace time.
         if (
             _os.environ.get("ATTNRES_MLA_FP32_FALLBACK", "0") == "1"
             and self._is_mla_self_attn()
+            and forward_batch.forward_mode.is_extend()
         ):
             return self._mla_forward_fp32(
                 attn_in, positions, forward_batch
