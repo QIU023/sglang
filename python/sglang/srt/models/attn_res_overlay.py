@@ -244,6 +244,110 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
                 # is just defensive.
                 shared.down_proj.reduce_results = False
 
+    def _is_mla_self_attn(self) -> bool:
+        """KimiDecoderLayer's self_attn is either KimiDelta (linear KDA)
+        or DeepseekV2AttentionMLA. Detect MLA by the projections it owns.
+        Cached on first call."""
+        cached = getattr(self, "_attnres_is_mla_cached", None)
+        if cached is not None:
+            return cached
+        sa = self.self_attn
+        is_mla = (
+            hasattr(sa, "kv_a_proj_with_mqa")
+            and hasattr(sa, "kv_b_proj")
+            and hasattr(sa, "kv_a_layernorm")
+        )
+        self._attnres_is_mla_cached = is_mla
+        return is_mla
+
+    def _mla_forward_fp32(
+        self,
+        attn_in: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """Eager fp32 MLA forward (EXTEND/prefill mode only).
+
+        Reproduces ``forward_normal_prepare`` + manual SDPA + ``o_proj``,
+        with score/softmax/value-mul in fp32. Writes the post-norm
+        ``kv_a`` and post-RoPE ``k_pe`` to SGLang's MLA KV buffer in the
+        same format flashinfer_mla expects, so subsequent **decode** steps
+        pull these correct K/V from cache and run native flashinfer_mla
+        on top — bf16 decode is numerically OK because per-step ``attn_in``
+        is one token (magnitudes don't accumulate the way prefill's do).
+
+        On Block AttnRes layer 16 (the deepest MLA), flashinfer_mla bf16
+        NaNs on prefill inputs with max~77; running prefill in fp32 fixes
+        the cached K/V; native bf16 decode then attends against good
+        cache → coherent generations end-to-end.
+
+        Caller invariant: only call when forward_batch.forward_mode is
+        an EXTEND-like mode. DECODE calls go through self_attn directly.
+        """
+        sa = self.self_attn
+        # Q projection. Our config has q_lora_rank=None, so q_proj is direct.
+        if getattr(sa, "q_lora_rank", None) is not None:
+            q_lora = sa.q_a_proj(attn_in)[0]
+            q_lora = sa.q_a_layernorm(q_lora)
+            q = sa.q_b_proj(q_lora)[0]
+        else:
+            q = sa.q_proj(attn_in)[0]
+        # [T, num_local_heads * qk_head_dim] -> [T, H, qk_head_dim]
+        q = q.view(-1, sa.num_local_heads, sa.qk_head_dim)
+
+        # KV path: kv_a_proj_with_mqa -> [T, kv_lora_rank + qk_rope_head_dim]
+        latent = sa.kv_a_proj_with_mqa(attn_in)[0]
+        kv_a_raw, k_pe_raw = latent.split(
+            [sa.kv_lora_rank, sa.qk_rope_head_dim], dim=-1
+        )
+        kv_a = sa.kv_a_layernorm(kv_a_raw.contiguous())
+        # k_pe is shared across heads (MQA-style) -> add head dim.
+        k_pe = k_pe_raw.unsqueeze(1)  # [T, 1, qk_rope_head_dim]
+
+        # Apply RoPE to q's PE half and to k_pe (in-place on q_pe slice
+        # mirrors forward_normal_prepare).
+        q_pe = q[..., sa.qk_nope_head_dim:]
+        if sa.rotary_emb is not None:
+            q_pe, k_pe = sa.rotary_emb(positions, q_pe, k_pe)
+        q[..., sa.qk_nope_head_dim:] = q_pe
+
+        # Write post-norm kv_a + post-RoPE k_pe to SGLang's MLA KV buffer.
+        # Same layout as forward_normal_prepare so a later decode step
+        # using native flashinfer_mla absorb-path reads compatible cache.
+        latent_cache = torch.cat(
+            [kv_a.unsqueeze(1), k_pe], dim=-1
+        )  # [T, 1, kv_lora_rank + qk_rope_head_dim]
+        sa._set_mla_kv_buffer(latent_cache, kv_a, k_pe, forward_batch)
+
+        # kv_b_proj: kv_a -> [T, num_local_heads * (qk_nope + v_head)]
+        kv = sa.kv_b_proj(kv_a)[0]
+        kv = kv.view(
+            -1, sa.num_local_heads, sa.qk_nope_head_dim + sa.v_head_dim
+        )
+        k_nope = kv[..., : sa.qk_nope_head_dim]
+        v = kv[..., sa.qk_nope_head_dim:]
+        # Build full K: cat(k_nope, k_pe broadcast across heads).
+        k_pe_h = k_pe.expand(-1, sa.num_local_heads, -1)
+        k = torch.cat([k_nope, k_pe_h], dim=-1)  # [T, H, qk_head_dim]
+
+        # SDPA in fp32. Need [B=1, H, T, D] layout for F.sdpa.
+        T = q.shape[0]
+        q4 = q.transpose(0, 1).unsqueeze(0).float()  # [1, H, T, qk_head_dim]
+        k4 = k.transpose(0, 1).unsqueeze(0).float()  # [1, H, T, qk_head_dim]
+        v4 = v.transpose(0, 1).unsqueeze(0).float()  # [1, H, T, v_head_dim]
+        scale = getattr(sa, "scaling", 1.0 / (sa.qk_head_dim ** 0.5))
+        # Causal mask is correct for EXTEND-only calls (each token in the
+        # extend window attends to itself + prior extend tokens). Decode
+        # uses native flashinfer_mla which handles the prefix-mask itself.
+        attn_out = F.scaled_dot_product_attention(
+            q4, k4, v4, is_causal=True, scale=scale,
+        )  # [1, H, T, v_head_dim]
+        attn_out = attn_out.squeeze(0).transpose(0, 1).contiguous()
+        attn_out = attn_out.to(attn_in.dtype)
+        attn_out = attn_out.reshape(T, sa.num_local_heads * sa.v_head_dim)
+        out, _ = sa.o_proj(attn_out)
+        return out
+
     def _run_attn(
         self,
         attn_input: torch.Tensor,
@@ -276,7 +380,49 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
             )
             return reduce_scatter_seq(attn_out_partial)
 
-        attn_in = self.input_layernorm(attn_input)
+        # Numerical-stability: when ATTNRES_FP32_NORM=1, RMSNorm the
+        # attn input in fp32 to avoid bf16 quantization of large outliers
+        # (Block AttnRes accumulates an unbounded residual stream which
+        # standard pre-norm transformers don't have, exposing bf16
+        # underflow in RMSNorm divisor for sparse-outlier inputs).
+        # ATTNRES_INPUT_CLAMP=N: hard-clamp the post-RMSNorm attn input
+        # to [-N, N] before flashinfer_mla. flashinfer_mla NaNs on
+        # high-magnitude bf16 inputs at deep blocks (RTX 5090 SM 12.0
+        # has no working alternative MLA backend). Clamping matches
+        # what RMSNorm DID succeed at producing in earlier blocks
+        # (max ~5-50) and prevents the deepest layer from triggering
+        # the flashinfer_mla internal overflow.
+        if _os.environ.get("ATTNRES_FP32_NORM", "0") == "1":
+            saved_dtype = attn_input.dtype
+            x = attn_input.to(torch.float32)
+            ln_w = self.input_layernorm.weight.to(torch.float32)
+            ln_eps = getattr(self.input_layernorm, "variance_epsilon", 1e-6)
+            rms = (x * x).mean(dim=-1, keepdim=True).add(ln_eps).rsqrt()
+            attn_in = (x * rms * ln_w).to(saved_dtype)
+        else:
+            attn_in = self.input_layernorm(attn_input)
+
+        # ATTNRES_MLA_FP32_FALLBACK=1: bypass flashinfer_mla on MLA layers
+        # **during EXTEND/prefill only**. Block AttnRes residuals grow to
+        # max~77 by the deepest MLA layer; flashinfer_mla's bf16 internals
+        # overflow to NaN at prefill on Blackwell (RTX 5090 SM 12.0).
+        # The fp32 path writes correct ``kv_a + k_pe`` to SGLang's MLA KV
+        # buffer in the format flashinfer expects, so subsequent decode
+        # steps fetch good cached K/V and run native bf16 flashinfer_mla
+        # without NaN (per-step decode input is 1 token; bf16 kernels
+        # don't fail on the small magnitudes there).
+        #
+        # No host-CPU sync (.item()) — cuda graph capture stays valid
+        # because forward_mode is known at trace time.
+        if (
+            _os.environ.get("ATTNRES_MLA_FP32_FALLBACK", "0") == "1"
+            and self._is_mla_self_attn()
+            and forward_batch.forward_mode.is_extend()
+        ):
+            return self._mla_forward_fp32(
+                attn_in, positions, forward_batch
+            )
+
         attn_out = self.self_attn(
             hidden_states=attn_in,
             positions=positions,
@@ -540,11 +686,48 @@ class KimiBlockAttnResModel(KimiLinearModel):
 
         cache_idx = 0
 
+        # Numerical-stability workaround for AttnRes residual stream
+        # accumulating to NaN at deep blocks. Two complementary knobs:
+        #   ATTNRES_BF16_ACCUM=1  → keep residual in bf16 (original)
+        #   default                → accumulate residual in fp32
+        #   ATTNRES_CLIP=N        → clamp partial_block to [-N, N] before
+        #                            each attn/mlp call; default 0 = off.
+        _fp32_accum = _os.environ.get("ATTNRES_BF16_ACCUM", "0") != "1"
+        _input_dtype = partial_block.dtype
+        if _fp32_accum:
+            partial_block = partial_block.to(torch.float32)
+        try:
+            _clip = float(_os.environ.get("ATTNRES_CLIP", "0"))
+        except Exception:
+            _clip = 0.0
+        def _maybe_clip(x):
+            if _clip <= 0:
+                return x
+            return x.clamp(min=-_clip, max=_clip)
+
+        _trace_fine = _os.environ.get("ATTNRES_NAN_TRACE", "0") == "1"
+        def _stats_pb(label):
+            if not _trace_fine:
+                return
+            t = partial_block
+            try:
+                nan = bool(t.isnan().any().item())
+                inf = bool(t.isinf().any().item())
+                am = float(t.detach().float().abs().mean().item())
+                amx = float(t.detach().float().abs().max().item())
+                _logger.warning(
+                    f"[NaN-FINE] {label}: abs_mean={am:.4f} "
+                    f"max={amx:.4f} nan={nan} inf={inf}"
+                )
+            except Exception as e:
+                _logger.warning(f"[NaN-FINE] {label}: {e}")
+
         # ---- Layer 0 attn + post-attn aggregation ----
         attn_out = L0._run_attn(
             h, positions, forward_batch, zero_allocator, seq_shard=seq_shard,
         )
         partial_block = attn_out
+        _stats_pb(f"L{layers_in_block[0].layer_id if hasattr(layers_in_block[0], "layer_id") else 0}_after_attn")
 
         h = block_attn_res_phase2_merge(
             rest_cache[cache_idx], partial_block,
@@ -553,19 +736,21 @@ class KimiBlockAttnResModel(KimiLinearModel):
         cache_idx += 1
         ffn_out = L0._run_mlp(h, seq_shard=seq_shard)
         partial_block = partial_block + ffn_out
+        _stats_pb(f"L{layers_in_block[0].layer_id if hasattr(layers_in_block[0], "layer_id") else 0}_after_mlp")
 
         # ---- Layers 1..L_block-1 ----
         for L in layers_in_block[1:]:
             # Pre-attn
             h = block_attn_res_phase2_merge(
-                rest_cache[cache_idx], partial_block,
+                rest_cache[cache_idx], _maybe_clip(partial_block).to(_input_dtype),
                 rest_queries[cache_idx], rest_norms[cache_idx],
             )
             cache_idx += 1
             attn_out = L._run_attn(
                 h, positions, forward_batch, zero_allocator, seq_shard=seq_shard,
             )
-            partial_block = partial_block + attn_out
+            partial_block = partial_block + attn_out.to(partial_block.dtype)
+            _stats_pb(f"L{L.layer_id if hasattr(L, "layer_id") else "?"}_after_attn")
             # Pre-FFN
             h = block_attn_res_phase2_merge(
                 rest_cache[cache_idx], partial_block,
@@ -574,6 +759,13 @@ class KimiBlockAttnResModel(KimiLinearModel):
             cache_idx += 1
             ffn_out = L._run_mlp(h, seq_shard=seq_shard)
             partial_block = partial_block + ffn_out
+            _stats_pb(f"L{L.layer_id if hasattr(L, "layer_id") else "?"}_after_mlp")
+
+        # Cast back to model dtype before returning so downstream code
+        # (committed_blocks scatter/stack, next block's RMSNorm, etc.)
+        # sees the original dtype.
+        if _fp32_accum:
+            partial_block = partial_block.to(_input_dtype)
 
         return committed_blocks, partial_block
 
@@ -608,12 +800,32 @@ class KimiBlockAttnResModel(KimiLinearModel):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        # NaN tracing: set ATTNRES_NAN_TRACE=1 to log per-layer NaN.
+        _trace = _os.environ.get("ATTNRES_NAN_TRACE", "0") == "1"
+        def _stats(t, name):
+            if not _trace or t is None:
+                return
+            try:
+                nan = bool(t.isnan().any().item())
+                inf = bool(t.isinf().any().item())
+                am = float(t.detach().float().abs().mean().item())
+                amx = float(t.detach().float().abs().max().item())
+                _logger.warning(
+                    f"[NaN-TRACE] {name}: shape={tuple(t.shape)} "
+                    f"dtype={t.dtype} abs_mean={am:.4f} max={amx:.4f} "
+                    f"nan={nan} inf={inf}"
+                )
+            except Exception as e:
+                _logger.warning(f"[NaN-TRACE] {name}: {e}")
+
         # First-stage init.
         if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 h = inputs_embeds
+                _stats(h, "input_embeds")
             else:
                 h = self.embed_tokens(input_ids)
+                _stats(h, "embed_tokens")
             block_list: list[torch.Tensor] = []
             partial_block = h
         else:
@@ -717,6 +929,7 @@ class KimiBlockAttnResModel(KimiLinearModel):
                     zero_allocator,
                     seq_shard=seq_shard_active,
                 )
+                _stats(partial_block, f"after_block_chunk_{chunk_start}")
 
         if not self.pp_group.is_last_rank:
             # Send (partial_block, blocks) to next PP stage.

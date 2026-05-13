@@ -58,6 +58,12 @@ def _load_image_to_pil(item: Union[str, bytes, Dict, "Image.Image"]) -> Image.Im
     if isinstance(item, (bytes, bytearray)):
         return Image.open(BytesIO(item)).convert("RGB")
     if isinstance(item, str):
+        # data URL (base64-inline) — used by RL rollouts to avoid the
+        # POSIX-SHM bridge race when running inside a Monarch actor.
+        if item.startswith("data:image/") and ";base64," in item:
+            import base64 as _b64
+            _, _, payload = item.partition(",")
+            return Image.open(BytesIO(_b64.b64decode(payload))).convert("RGB")
         # Path or URL string
         return Image.open(item).convert("RGB")
     raise ValueError(f"unsupported image item type: {type(item).__name__}")
