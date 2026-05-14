@@ -36,6 +36,7 @@ class so the text-only AttnRes overlay can ship first.
 from __future__ import annotations
 
 import logging
+import os as _os
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Tuple
 
@@ -60,6 +61,27 @@ from sglang.srt.models.attn_res_overlay import KimiBlockAttnResForCausalLM
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+# Env-flag-guarded NaN-hunt instrumentation. Set ATTNRES_NAN_TRACE=1 to
+# log shape/min/max/mean/nan/inf at each VL forward stage (vision /
+# projector / embed-merge). Mirrors the per-layer LM tracing already in
+# attn_res_overlay.py. Off by default — zero cost in production.
+_VL_NAN_TRACE = _os.environ.get("ATTNRES_NAN_TRACE", "0") == "1"
+
+
+def _vl_stats(t, name: str) -> None:
+    if not _VL_NAN_TRACE or t is None:
+        return
+    try:
+        tf = t.detach().float()
+        logger.warning(
+            f"[VL-NaN-TRACE] {name}: shape={tuple(t.shape)} dtype={t.dtype} "
+            f"min={tf.min().item():.4f} max={tf.max().item():.4f} "
+            f"mean={tf.mean().item():.4f} nan={bool(tf.isnan().any().item())} "
+            f"inf={bool(tf.isinf().any().item())}"
+        )
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"[VL-NaN-TRACE] {name}: <stat error: {e}>")
 
 
 _DEFAULT_IMAGE_TOKEN_ID = 32000  # Llama-3.1 reserved special token, see phase5/multimodal_dataset.py
@@ -260,9 +282,11 @@ class KimiAttnResVLForConditionalGeneration(nn.Module):
         ):
             return pixel_values
 
+        _vl_stats(pixel_values, "vision.pixel_values")
         with torch.no_grad():
             vision_out = self.vision_tower(pixel_values=pixel_values)
             vision_features = vision_out.last_hidden_state  # [B, N_vis, D_vis]
+        _vl_stats(vision_features, "vision.last_hidden_state")
 
         # Cast to projector's dtype (LM is bf16; vision_tower is fp32
         # by default since it was loaded outside our default-dtype
@@ -272,6 +296,7 @@ class KimiAttnResVLForConditionalGeneration(nn.Module):
         B, N_vis, D_vis = vision_features.shape
         flat = vision_features.reshape(B * N_vis, D_vis)
         projected = self.mm_projector(flat)  # [B*N_vis, D_llm]
+        _vl_stats(projected, "projector.output")
         return projected
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
@@ -291,6 +316,84 @@ class KimiAttnResVLForConditionalGeneration(nn.Module):
     # forward + load
     # ------------------------------------------------------------------
 
+    def _collect_attention_layers(self) -> list:
+        """Build the per-layer attention-module list indexed by global
+        ``layer_id``, mirroring ``ModelRunner.init_piecewise_cuda_graphs``
+        (model_runner.py:~2850).
+
+        Both KDA *and* MLA layers route through ``context.attention_layers``:
+
+        * KDA layers: ``RadixLinearAttention.forward`` takes the
+          ``unified_linear_attention_with_output`` fast path when
+          ``get_forward_context()`` is non-None, and that helper indexes
+          ``context.attention_layers[layer_id]`` to fetch the live KDA
+          module (radix_linear_attention.py:119).
+        * MLA layers: ``RadixAttention.forward`` ALSO takes the
+          ``unified_attention_with_output`` fast path under a non-None
+          forward context (radix_attention.py:122), which indexes
+          ``context.attention_layers[layer_id]`` and passes the resolved
+          module as the ``layer`` arg to
+          ``hybrid_linear_attn_backend.forward``.
+
+        The list is consulted *only on the extend/prefill path* —
+        ``radix_attention.py:122`` gates the fast path on
+        ``forward_batch.forward_mode.is_extend()``; decode takes the
+        ``else`` branch and passes ``self`` directly, never touching the
+        list. During VLM prefill, ``DeepseekV2AttentionMLA`` runs the
+        un-absorbed MHA path (``forward_mha.py`` → ``attn_mha``), NOT the
+        absorbed ``attn_mqa`` path. So for MLA layers the list must carry
+        ``attn_mha`` — its ``head_dim`` is ``qk_nope+qk_rope`` (the q
+        actually produced during prefill). Storing ``attn_mqa`` (head_dim
+        ``kv_lora_rank+qk_rope``) makes ``flashinfer_mla_backend`` reshape
+        the prefill q with the wrong head_dim and ``RuntimeError`` on the
+        ``q.view`` (canonical LM path dodges this because its piecewise
+        runner installs the context only for decode, so prefill MLA takes
+        the ``else`` branch and the list is never consulted for MLA).
+
+        Therefore the list MUST be (a) non-empty, (b) indexed by the
+        *global* layer index, and (c) carry a real ``RadixAttention`` /
+        ``RadixLinearAttention`` for EVERY layer — no ``None`` holes.
+
+        Per-layer module pick: ``self_attn.attn`` (KDA
+        ``RadixLinearAttention``) if present, else ``self_attn.attn_mha``
+        (DeepSeek MLA — the prefill module). Cached after first build.
+        """
+        cached = getattr(self, "_attnres_attention_layers", None)
+        if cached is not None:
+            return cached
+        layers = []
+        lm_model = self.language_model.model
+        for idx in range(len(lm_model.layers)):
+            layer = lm_model.layers[idx]
+            self_attn = getattr(layer, "self_attn", None)
+            attn_mod = None
+            if self_attn is not None:
+                # KDA linear-attn layer.
+                attn_mod = getattr(self_attn, "attn", None)
+                if attn_mod is None:
+                    # DeepSeek-V2 MLA layer: register attn_mha (the
+                    # un-absorbed prefill module), NOT attn_mqa. The list
+                    # is only indexed on the extend/prefill path, and
+                    # prefill runs forward_mha.py -> attn_mha. attn_mqa's
+                    # head_dim (kv_lora_rank+qk_rope) would mismatch the
+                    # prefill q (qk_nope+qk_rope) and crash the backend's
+                    # q.view. Both share layer_id; attn_mha is the one
+                    # whose head_dim/v_head_dim match the prefill tensors.
+                    attn_mod = getattr(self_attn, "attn_mha", None)
+            if attn_mod is None:
+                # Should never happen for our Kimi configs (every layer is
+                # KDA or MLA). Fail loud rather than leave a None hole that
+                # KeyErrors deep in the attention backend.
+                raise RuntimeError(
+                    f"attn_res_vl_overlay: could not resolve an attention "
+                    f"module for layer {idx} (self_attn={type(self_attn).__name__ if self_attn else None}); "
+                    f"_collect_attention_layers would leave a None hole that "
+                    f"breaks context.attention_layers indexing."
+                )
+            layers.append(attn_mod)
+        self._attnres_attention_layers = layers
+        return layers
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -298,22 +401,58 @@ class KimiAttnResVLForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
     ):
-        # SGLang's piecewise CUDA graph runner explicitly disables
-        # itself when ``forward_batch.input_embeds is not None`` (see
-        # ``piecewise_cuda_graph_runner.py:can_run`` with TODO(yuwei)).
-        # That path is what sets up the global ``_forward_context``,
-        # which KDA's ``RadixLinearAttention.forward`` consults to
-        # decide between the (mixed_qkv, a, b) helper and the standard
-        # ``AttentionBackend.forward(q, k, v)``. With no piecewise
-        # context, KDA falls to the wrong branch and crashes.
+        # KDA's ``RadixLinearAttention.forward`` branches on
+        # ``forward_batch.forward_mode.is_extend() and
+        # get_forward_context() is not None``. The global
+        # ``_forward_context`` is normally installed by SGLang's
+        # piecewise CUDA-graph runner — but that runner is disabled for
+        # this multimodal model (``init_piecewise_cuda_graphs`` bails on
+        # non-language-model carriers / ``input_embeds`` prefills), so
+        # during VLM prefill the context is None. KDA then falls to the
+        # ``else`` branch which passes the *un-narrowed* ``mixed_qkv``
+        # (still padded to the cuda-graph bucket length) straight to the
+        # linear-attn backend, corrupting the KDA recurrent state for
+        # every KDA layer. The damage cascades through the AttnRes
+        # residual stream and the model emits NaN logits ->
+        # ``argmax(NaN)`` -> token id 0 (``!`` in this tokenizer) ->
+        # the all-``!!!!`` garbage symptom. This reproduces even on a
+        # weight-verified checkpoint, confirming it is a forward-path
+        # wiring bug, not a checkpoint problem.
         #
-        # Workaround: wrap the multimodal embed routine in a
-        # ``set_forward_context`` block ourselves. KDA only needs
-        # the context to be non-None for its IF gate; the contents
-        # don't matter for the unified_linear_attention_with_output
-        # path. Pass empty lists for attention/moe layers — those
-        # are only consumed by piecewise-cuda-graph capture, which
-        # is already off here.
+        # Fix: install the forward context ourselves around the embed
+        # routine, with a correctly layer-id-indexed attention-layers
+        # list so the ``unified_linear_attention_with_output`` custom op
+        # narrows ``mixed_qkv``/``a``/``b`` to ``real_num_tokens`` and
+        # picks up the right KDA module. ``moe_layers`` / ``moe_fusions``
+        # stay empty — they are only consumed by piecewise-graph capture,
+        # which is off here, and KimiMoE does its own routing.
+        from sglang.srt.compilation.piecewise_context_manager import (
+            get_forward_context,
+            set_forward_context,
+        )
+
+        if (
+            forward_batch.forward_mode.is_extend()
+            and get_forward_context() is None
+        ):
+            attention_layers = self._collect_attention_layers()
+            with set_forward_context(
+                forward_batch=forward_batch,
+                attention_layers=attention_layers,
+                quant_config=self.quant_config,
+                moe_layers=[],
+                moe_fusions=[],
+            ):
+                return general_mm_embed_routine(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    language_model=self.language_model,
+                    data_embedding_funcs={
+                        Modality.IMAGE: self.get_image_feature,
+                    },
+                    positions=positions,
+                )
+
         return general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,

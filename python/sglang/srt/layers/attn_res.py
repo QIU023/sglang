@@ -289,7 +289,16 @@ def block_attn_res_phase2_merge(
         and _phase2_merge_norm_triton is not None
     ):
         weight = _extract_norm_weight(norm)
-        eps = getattr(norm, "eps", 1e-6)
+        # SGLang's ``layers.layernorm.RMSNorm`` stores its epsilon as
+        # ``variance_epsilon`` (only ``torch.nn.RMSNorm`` / the test stub
+        # use ``eps``). Reading ``eps`` first silently fell back to the
+        # 1e-6 default for every real RMSNorm here, while the torch
+        # reference path below (and the training-side aggregator) use the
+        # module's true eps (1e-5 for Kimi). Check both names so the
+        # fused-kernel path matches the torch path bit-for-bit.
+        eps = getattr(norm, "variance_epsilon", None)
+        if eps is None:
+            eps = getattr(norm, "eps", 1e-6)
         if weight is not None:
             return _phase2_merge_norm_triton(
                 committed_part, lse_committed,
