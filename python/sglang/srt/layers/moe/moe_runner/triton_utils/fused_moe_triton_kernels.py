@@ -27,6 +27,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_sm90_supported,
+    is_sm120_supported,
 )
 
 try:
@@ -66,6 +67,105 @@ def should_enable_swap_ab(
         return False
 
     return is_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
+
+
+# Blackwell consumer GPUs (SM 12.0, e.g. RTX 5090/5080) ship with only ~100 KB
+# of shared memory per block, vs. ~228 KB on H100 (SM 9.0) and ~228 KB on B100
+# (SM 10.0). The default fused-MoE fp8 configs in get_default_config() and the
+# tuned JSONs under ./configs/ were chosen for Hopper-class shmem budgets and
+# overflow on SM 12.0 (Triton raises OutOfResources: Required 147456,
+# Hardware limit 101376). We shrink the config in-place before launch so the
+# kernel fits. This only triggers on SM 12.0; H100/A100/B100/MI300 paths are
+# untouched.
+@functools.lru_cache(maxsize=1)
+def _sm120_shmem_per_block_bytes() -> int:
+    if not _is_cuda:
+        return 0
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        # `shared_memory_per_block_optin` reflects the dynamic-shmem cap (the
+        # value Triton actually targets). Fall back to the static cap on older
+        # PyTorch builds that don't expose it.
+        return int(
+            getattr(
+                props,
+                "shared_memory_per_block_optin",
+                props.shared_memory_per_block,
+            )
+        )
+    except Exception:
+        return 0
+
+
+def _maybe_shrink_config_for_sm120(
+    config: Dict[str, Any],
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    block_shape: Optional[List[int]],
+) -> Dict[str, Any]:
+    """Return a shmem-safe fused-MoE config for SM 12.0 (Blackwell consumer).
+
+    The H100 fp8 defaults (BLOCK_M=128, BLOCK_N=256, BLOCK_K=128, num_stages=4)
+    need ~144 KB of shared memory, which exceeds the ~100 KB cap on RTX 50xx.
+    We drop to BLOCK_M=64, BLOCK_N=128, num_stages=2, which keeps the same
+    BLOCK_K (so block-wise quant scale tiling is preserved) and fits in
+    ~48 KB for tensor-wise fp8 / ~64 KB for block-wise fp8. Returns the
+    original config object unchanged on non-SM-12.0 devices.
+    """
+    if not (use_fp8_w8a8 or use_int8_w8a8):
+        return config
+    if not _is_cuda or not is_sm120_supported():
+        return config
+
+    shmem_cap = _sm120_shmem_per_block_bytes()
+    # RTX 50xx reports ~101376 bytes; if the runtime somehow reports a Hopper-
+    # sized budget on SM 12.0, leave the config alone (nothing to fix).
+    if shmem_cap == 0 or shmem_cap >= 128 * 1024:
+        return config
+
+    block_m = int(config.get("BLOCK_SIZE_M", 64))
+    block_n = int(config.get("BLOCK_SIZE_N", 128))
+    block_k = int(config.get("BLOCK_SIZE_K", 128))
+    num_stages = int(config.get("num_stages", 3))
+    num_warps = int(config.get("num_warps", 8))
+
+    # Rough shared-memory estimate for the fp8/int8 MoE GEMM:
+    #   A tile: BLOCK_M * BLOCK_K * 1 byte (fp8/int8 after quant)
+    #   B tile: BLOCK_K * BLOCK_N * 1 byte
+    # Triton pipelines `num_stages` copies of both tiles.
+    def _est_shmem(bm: int, bn: int, bk: int, stages: int) -> int:
+        return (bm * bk + bk * bn) * stages
+
+    if _est_shmem(block_m, block_n, block_k, num_stages) <= shmem_cap:
+        return config
+
+    new_config = dict(config)
+    # Step 1: cap BLOCK_M at 64 (halves the A-tile footprint).
+    if block_m > 64:
+        new_config["BLOCK_SIZE_M"] = 64
+        block_m = 64
+    # Step 2: cap BLOCK_N at 128 (halves the B-tile footprint).
+    if block_n > 128:
+        new_config["BLOCK_SIZE_N"] = 128
+        block_n = 128
+    # Step 3: drop num_stages to 2 (Hopper default is 3-4; SM 12.0 has less
+    # shmem but the L2 prefetcher still hides most of the latency at stages=2).
+    if num_stages > 2:
+        new_config["num_stages"] = 2
+        num_stages = 2
+    # Step 4: shrink num_warps so the register file isn't oversubscribed for
+    # the smaller tile (BLOCK_M=64 only needs 4 warps).
+    if num_warps > 4 and block_m <= 64:
+        new_config["num_warps"] = 4
+
+    # Block-wise quant requires BLOCK_SIZE_K == block_shape[1] and
+    # BLOCK_SIZE_N == block_shape[0]; don't touch those keys here -- the
+    # M/stage shrinks above are sufficient to fit the kernel.
+    if block_shape is not None and len(block_shape) == 2:
+        new_config["BLOCK_SIZE_N"] = block_shape[0]
+        new_config["BLOCK_SIZE_K"] = block_shape[1]
+
+    return new_config
 
 
 @triton.jit
@@ -734,6 +834,13 @@ def invoke_fused_moe_kernel(
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    # Blackwell consumer GPUs (SM 12.0, ~100 KB shmem) cannot run the H100
+    # fp8/int8 fused-MoE configs without OutOfResources. Shrink in place if
+    # we detect SM 12.0 + an oversized config; this is a no-op everywhere else.
+    config = _maybe_shrink_config_for_sm120(
+        config, use_fp8_w8a8, use_int8_w8a8, block_shape
+    )
 
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])

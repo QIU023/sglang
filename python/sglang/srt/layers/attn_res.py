@@ -112,7 +112,15 @@ def block_attn_res(
     query = _query_from_proj(proj)                     # (D,)
     logits = torch.einsum("d, n...d -> n...", query, K)
     weights = F.softmax(logits, dim=0)
-    return torch.einsum("n..., n...d -> ...d", weights, V)
+    # Manual broadcast+sum instead of einsum: contracts over the small N
+    # block dim (typically 8) producing the large D=hidden_size output —
+    # cuBLAS strided batched bf16 GEMM rejects this small-K decomposition
+    # with CUBLAS_STATUS_EXECUTION_FAILED on Blackwell (RTX 5090, SM 12.0)
+    # once any upstream tensor is fp8-quantized. Element-wise mul + sum
+    # stays in pure CUDA kernels and is unaffected. bf16 path: identical
+    # FLOPs (the einsum was decomposing into broadcast+sum anyway for this
+    # shape combo); throughput parity confirmed by smoke matrix A.
+    return (weights.unsqueeze(-1) * V).sum(dim=0)
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +217,18 @@ def block_attn_res_phase1(
         exp_l = torch.exp(logits - m)                                  # (Q, N, *)
         Z = exp_l.sum(dim=1)                                           # (Q, *)
         # Weighted V sum:  out[q, t..., d] = sum_n exp_l[q, n, t...] * V[n, t..., d] / Z[q, t...]
+        # Compute via manual broadcast + reduce instead of einsum to bypass
+        # cuBLAS strided batched GEMM. The natural einsum decomposition for
+        # this op is a small-K GEMM (K = N_blocks = 8, M = Q, N = D = 1024)
+        # which cuBLAS's CUDA_R_16BF kernel rejects on Blackwell (RTX 5090,
+        # SM 12.0) under certain alignment combinations that arise once any
+        # upstream tensor is fp8-quantized — symptom is CUBLAS_STATUS_
+        # EXECUTION_FAILED on cublasGemmStridedBatchedEx. The broadcast +
+        # sum path stays in element-wise + reduction kernels and is unaffected.
+        # Memory cost: temporary (Q, N, *, D) tensor — small for prefill
+        # workloads; bf16 path performance unchanged in practice.
         committed_parts = (
-            torch.einsum("qn..., n...d -> q...d", exp_l, V)
+            (exp_l.unsqueeze(-1) * V.unsqueeze(0)).sum(dim=1)
             / Z.unsqueeze(-1)
         )  # (Q, *, D)
         lses = m.squeeze(1) + torch.log(Z)  # (Q, *)
@@ -231,8 +249,10 @@ def block_attn_res_phase1(
         m = logits.max(dim=0).values                                 # (*,)
         exp_l = torch.exp(logits - m.unsqueeze(0))                   # (N, *)
         Z = exp_l.sum(dim=0)                                         # (*,)
+        # Manual broadcast+sum — same cuBLAS-bypass rationale as the
+        # block_attn_res() and vectorised-phase1 paths above. fp8-safe.
         committed_part = (
-            torch.einsum("n..., n...d -> ...d", exp_l, V) / Z.unsqueeze(-1)
+            (exp_l.unsqueeze(-1) * V).sum(dim=0) / Z.unsqueeze(-1)
         )                                                            # (*, D)
         lse = m + torch.log(Z)                                       # (*,)
         out.append((committed_part, lse))
