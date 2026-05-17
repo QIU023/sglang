@@ -27,6 +27,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_sm90_supported,
+    is_sm120_supported,
 )
 
 try:
@@ -66,6 +67,95 @@ def should_enable_swap_ab(
         return False
 
     return is_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
+
+
+@functools.lru_cache(maxsize=1)
+def _sm120_shmem_per_block_bytes() -> int:
+    """Shared-memory-per-block cap of the current device, in bytes.
+
+    Blackwell consumer GPUs (SM 12.0, e.g. RTX 5090/5080) cap at ~100 KB vs
+    ~228 KB on H100 (SM 9.0) / B100 (SM 10.0), so the Hopper-tuned fused-MoE
+    fp8 configs from get_default_config() / the tuned JSONs under ./configs/
+    overflow there (Triton OutOfResources: Required 147456, Hardware limit
+    101376).
+    """
+    if not _is_cuda:
+        return 0
+    try:
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        # Prefer the dynamic-shmem cap Triton targets; fall back on older PyTorch builds.
+        return int(
+            getattr(
+                props,
+                "shared_memory_per_block_optin",
+                props.shared_memory_per_block,
+            )
+        )
+    except Exception:
+        return 0
+
+
+def _maybe_shrink_config_for_sm120(
+    config: Dict[str, Any],
+    use_fp8_w8a8: bool,
+    use_int8_w8a8: bool,
+    block_shape: Optional[List[int]],
+) -> Dict[str, Any]:
+    """Return a shmem-safe fused-MoE config for SM 12.0 (Blackwell consumer).
+
+    The H100 fp8 defaults (BLOCK_M=128, BLOCK_N=256, BLOCK_K=128, num_stages=4)
+    need ~144 KB of shared memory, which exceeds the ~100 KB cap on RTX 50xx.
+    We drop to BLOCK_M=64, BLOCK_N=128, num_stages=2, which keeps the same
+    BLOCK_K (so block-wise quant scale tiling is preserved) and fits in
+    ~48 KB for tensor-wise fp8 / ~64 KB for block-wise fp8. Returns the
+    original config object unchanged on non-SM-12.0 devices.
+    """
+    if not (use_fp8_w8a8 or use_int8_w8a8):
+        return config
+    if not _is_cuda or not is_sm120_supported():
+        return config
+
+    shmem_cap = _sm120_shmem_per_block_bytes()
+    # A zero or Hopper-sized cap means there is nothing to fix on this device.
+    if shmem_cap == 0 or shmem_cap >= 128 * 1024:
+        return config
+
+    block_m = int(config.get("BLOCK_SIZE_M", 64))
+    block_n = int(config.get("BLOCK_SIZE_N", 128))
+    block_k = int(config.get("BLOCK_SIZE_K", 128))
+    num_stages = int(config.get("num_stages", 3))
+    num_warps = int(config.get("num_warps", 8))
+
+    # A/B tiles are 1 byte/elem post-quant; Triton pipelines num_stages copies of both.
+    def _est_shmem(bm: int, bn: int, bk: int, stages: int) -> int:
+        return (bm * bk + bk * bn) * stages
+
+    if _est_shmem(block_m, block_n, block_k, num_stages) <= shmem_cap:
+        return config
+
+    new_config = dict(config)
+    # Cap BLOCK_M at 64 (halves the A-tile footprint).
+    if block_m > 64:
+        new_config["BLOCK_SIZE_M"] = 64
+        block_m = 64
+    # Cap BLOCK_N at 128 (halves the B-tile footprint).
+    if block_n > 128:
+        new_config["BLOCK_SIZE_N"] = 128
+        block_n = 128
+    # Drop num_stages to 2; SM 12.0's L2 prefetcher still hides most latency there.
+    if num_stages > 2:
+        new_config["num_stages"] = 2
+        num_stages = 2
+    # BLOCK_M=64 only needs 4 warps; avoids register-file oversubscription.
+    if num_warps > 4 and block_m <= 64:
+        new_config["num_warps"] = 4
+
+    # Block-wise quant pins BLOCK_SIZE_N/K to block_shape; restore them in case the N cap above clobbered N.
+    if block_shape is not None and len(block_shape) == 2:
+        new_config["BLOCK_SIZE_N"] = block_shape[0]
+        new_config["BLOCK_SIZE_K"] = block_shape[1]
+
+    return new_config
 
 
 @triton.jit
@@ -748,6 +838,11 @@ def invoke_fused_moe_kernel(
 ) -> None:
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
+
+    # SM 12.0 (~100 KB shmem) overflows on Hopper-tuned fp8/int8 configs; no-op everywhere else.
+    config = _maybe_shrink_config_for_sm120(
+        config, use_fp8_w8a8, use_int8_w8a8, block_shape
+    )
 
     if use_fp8_w8a8:
         swap_ab = should_enable_swap_ab(config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"])
