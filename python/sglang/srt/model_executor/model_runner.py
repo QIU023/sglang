@@ -114,12 +114,20 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.moe.routed_experts_capturer import (
+from sglang.srt.state_capturer.routed_experts import (
     RoutedExpertsCapturer,
-    RoutedExpertsOutput,
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
+# Trunk-drift shim (agent_a 2026-05-24): RoutedExpertsOutput dataclass was
+# deleted by upstream PR #24403 (commit c4c0376fc) when consolidating the
+# routed-experts capturer onto BaseTopkCapturer. The fork branch
+# `attention_residual_inference` (dc154e785) still references it only in a
+# `Optional[...]` type annotation on ModelRunnerOutput.routed_experts_output.
+# Replace with `Any` to unblock import; no runtime behaviour change since
+# the field is only populated by an MoE return-routed-experts code path
+# that requires explicit opt-in (not used by Qwen2.5-VL serving).
+from typing import Any as RoutedExpertsOutput  # noqa: E402
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.sampler import create_sampler
@@ -300,6 +308,12 @@ class ModelRunnerOutput:
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[RoutedExpertsOutput] = None
+    # Trunk-drift shim (agent_a 2026-05-24): post-refactor upstream consumers
+    # (tp_worker, scheduler_output_processor_mixin, eagle_worker_v2,
+    # disaggregation/prefill) read `out.indexer_topk_output`. The fork branch
+    # ModelRunnerOutput predates that field. None is the right default for
+    # non-NSA-indexer paths (only DeepSeek-V3-style models populate it).
+    indexer_topk_output: Optional[object] = None
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -3176,12 +3190,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
-        output.routed_experts_output = get_global_experts_capturer().on_forward_end(
-            forward_batch=forward_batch,
-            can_run_graph=output.can_run_graph,
-            cuda_graph_batch=getattr(self.graph_runner, "bs", None),
-            no_copy_to_cpu=no_copy_to_cpu,
-        )
+        # Trunk-drift shim (agent_a 2026-05-24): post-refactor
+        # get_global_experts_capturer() returns None when MoE
+        # return_routed_experts is not enabled (the default for non-MoE models
+        # like Qwen2.5-VL). The fork branch's call site assumed a no-op stub.
+        _capturer = get_global_experts_capturer()
+        if _capturer is not None:
+            output.routed_experts_output = _capturer.on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+                no_copy_to_cpu=no_copy_to_cpu,
+            )
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()
