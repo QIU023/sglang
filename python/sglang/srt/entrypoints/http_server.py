@@ -72,6 +72,12 @@ from sglang.srt.entrypoints.engine import (
     run_detokenizer_process,
     run_scheduler_process,
 )
+
+# Trunk-drift shim (qwen25_vla_inference 2026-05-24): veRL's
+# async_sglang_server imports `_launch_subprocesses` from this module
+# (upstream sglang exposed it module-level). Our fork only exposes it
+# as a method on Engine. Re-export as module-level alias for API parity.
+_launch_subprocesses = Engine._launch_subprocesses
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
     OllamaGenerateRequest,
