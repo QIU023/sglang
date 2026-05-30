@@ -727,7 +727,7 @@ class KimiBlockAttnResModel(KimiLinearModel):
             h, positions, forward_batch, zero_allocator, seq_shard=seq_shard,
         )
         partial_block = attn_out
-        _stats_pb(f"L{layers_in_block[0].layer_id if hasattr(layers_in_block[0], "layer_id") else 0}_after_attn")
+        _stats_pb(f"L{layers_in_block[0].layer_id if hasattr(layers_in_block[0], 'layer_id') else 0}_after_attn")
 
         h = block_attn_res_phase2_merge(
             rest_cache[cache_idx], partial_block,
@@ -736,7 +736,7 @@ class KimiBlockAttnResModel(KimiLinearModel):
         cache_idx += 1
         ffn_out = L0._run_mlp(h, seq_shard=seq_shard)
         partial_block = partial_block + ffn_out
-        _stats_pb(f"L{layers_in_block[0].layer_id if hasattr(layers_in_block[0], "layer_id") else 0}_after_mlp")
+        _stats_pb(f"L{layers_in_block[0].layer_id if hasattr(layers_in_block[0], 'layer_id') else 0}_after_mlp")
 
         # ---- Layers 1..L_block-1 ----
         for L in layers_in_block[1:]:
@@ -750,7 +750,7 @@ class KimiBlockAttnResModel(KimiLinearModel):
                 h, positions, forward_batch, zero_allocator, seq_shard=seq_shard,
             )
             partial_block = partial_block + attn_out.to(partial_block.dtype)
-            _stats_pb(f"L{L.layer_id if hasattr(L, "layer_id") else "?"}_after_attn")
+            _stats_pb(f"L{L.layer_id if hasattr(L, 'layer_id') else '?'}_after_attn")
             # Pre-FFN
             h = block_attn_res_phase2_merge(
                 rest_cache[cache_idx], partial_block,
@@ -759,7 +759,7 @@ class KimiBlockAttnResModel(KimiLinearModel):
             cache_idx += 1
             ffn_out = L._run_mlp(h, seq_shard=seq_shard)
             partial_block = partial_block + ffn_out
-            _stats_pb(f"L{L.layer_id if hasattr(L, "layer_id") else "?"}_after_mlp")
+            _stats_pb(f"L{L.layer_id if hasattr(L, 'layer_id') else '?'}_after_mlp")
 
         # Cast back to model dtype before returning so downstream code
         # (committed_blocks scatter/stack, next block's RMSNorm, etc.)
