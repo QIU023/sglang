@@ -129,20 +129,30 @@ class KimiAttnResVLImageProcessor(SGLangBaseProcessor):
         # exist; if text has no placeholders but images are supplied,
         # prepend one placeholder per image to honor the request.
         if n_images_in_text == 0 and n_images > 0:
-            prompt_text = (
-                (self.image_token_str + "\n") * n_images + prompt_text
-            )
+            # No separator after the placeholder: a stray "\n" right after
+            # the image block would be an extra OOD token vs the in-tree
+            # layout ([IMG]*196 + [BOS] + text).
+            prompt_text = self.image_token_str * n_images + prompt_text
             chunks = prompt_text.split(self.image_token_str)
             n_images_in_text = len(chunks) - 1
 
         # Tokenize each text chunk separately and splice in image
         # token IDs between them, tracking offsets per image.
+        #
+        # CRITICAL — the token layout MUST match the in-tree eval /
+        # SFT training format exactly: ``[IMG]*196 + [BOS] + text``.
+        # The BOS comes *after* the image block (training never placed
+        # BOS before the image tokens; see eval_common.build_input_ids
+        # and multimodal_dataset). So encode every chunk with
+        # add_special_tokens=False (no auto-BOS at the very front) and
+        # manually insert BOS right after the (first) image splice,
+        # immediately before the following text chunk.
+        bos_id = self._tokenizer.bos_token_id or 128000
         input_ids: list[int] = []
         image_offsets: list[tuple[int, int]] = []
+        bos_inserted = False
         for i, chunk in enumerate(chunks):
-            chunk_ids = self._tokenizer.encode(
-                chunk, add_special_tokens=(i == 0)
-            )
+            chunk_ids = self._tokenizer.encode(chunk, add_special_tokens=False)
             input_ids.extend(chunk_ids)
             if i < len(chunks) - 1:
                 start = len(input_ids)
@@ -153,6 +163,11 @@ class KimiAttnResVLImageProcessor(SGLangBaseProcessor):
                 # token_count = end - start + 1. So for 196 vision
                 # tokens, end = start + 195.
                 image_offsets.append((start, start + self.num_vision_tokens - 1))
+                # BOS goes AFTER the image block (matches in-tree
+                # eval_common.build_input_ids and the SFT dataset layout).
+                if not bos_inserted:
+                    input_ids.append(bos_id)
+                    bos_inserted = True
 
         mm_items = self._build_mm_items(image_data)
         # Bind one offset tuple per image item, in order.
@@ -170,6 +185,8 @@ class KimiAttnResVLImageProcessor(SGLangBaseProcessor):
     ) -> List[MultimodalDataItem]:
         if not image_data:
             return []
+        from sglang.srt.managers.mm_utils import hash_feature
+
         items: list[MultimodalDataItem] = []
         for img in image_data:
             pil = _load_image_to_pil(img)
@@ -177,14 +194,33 @@ class KimiAttnResVLImageProcessor(SGLangBaseProcessor):
             # to the standard 224x224 normalised tensor).
             ip_out = self._image_processor(images=pil, return_tensors="pt")
             pixel_values = ip_out.pixel_values  # [1, 3, 224, 224]
-            items.append(
-                MultimodalDataItem(
-                    feature=pixel_values,
-                    modality=Modality.IMAGE,
-                    # SGLang's mm_inputs path computes the placement
-                    # mask by ``input_ids == item.pad_value``, so this
-                    # must match the image-token id we splice in.
-                    pad_value=self.image_token_id,
-                )
+            item = MultimodalDataItem(
+                feature=pixel_values,
+                modality=Modality.IMAGE,
             )
+            # Content-dependent hash + derived content-dependent pad_value.
+            #
+            # Two consumers depend on this:
+            #   1. The per-image multimodal embedding cache
+            #      (mm_utils._get_chunked_embedding_by_item) keys on
+            #      ``item.hash`` — a None/constant hash would collide every
+            #      image onto one cache slot, so the first image's vision
+            #      features get reused for all subsequent images and the LM
+            #      never sees the real pixels.
+            #   2. RadixCache prefix matching keys on the *token ids* of the
+            #      prefix. Our 196 image placeholders are all the constant
+            #      sentinel id (32000) in the raw input_ids, so two requests
+            #      with DIFFERENT images but the same question would share an
+            #      identical radix prefix and the second would wrongly reuse
+            #      the first's image KV. That is exactly why radix had to be
+            #      disabled. The fix mirrors mainline kimi_vl: compute a
+            #      *content-derived* pad_value (MM_PAD_SHIFT_VALUE + hash) and
+            #      rewrite the placeholder positions to it in pad_input_ids
+            #      (below), so distinct images yield distinct radix prefixes.
+            #
+            # We hash explicitly here, then call set_pad_value() which derives
+            # pad_value = MM_PAD_SHIFT_VALUE + (hash % 2^30) from that hash.
+            item.hash = hash_feature(pixel_values)
+            item.set_pad_value()
+            items.append(item)
         return items

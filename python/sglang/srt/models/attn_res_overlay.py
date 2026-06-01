@@ -588,8 +588,26 @@ class KimiBlockAttnResModel(KimiLinearModel):
         ), "num_attention_heads must be divisible by world_size"
 
         # Block boundary detection (Kimi paper: layer_idx % layers_per_block == 0).
-        n_blocks = getattr(config, "attn_res_num_blocks", 4)
-        self.layers_per_block = max(1, config.num_hidden_layers // n_blocks)
+        # ``attn_res_num_blocks`` is now a declared KimiLinearConfig field
+        # (validated at config construction: 1<=N<=L and L%N==0). Require it
+        # explicitly rather than silently defaulting to 4 — a mismatch with
+        # the trained block count silently changes which layers commit blocks
+        # and corrupts the residual-stream aggregation.
+        n_blocks = getattr(config, "attn_res_num_blocks", None)
+        if n_blocks is None:
+            raise ValueError(
+                "KimiBlockAttnResModel requires config.attn_res_num_blocks to "
+                "be set (the trained Block-AttnRes block count). The checkpoint "
+                "config.json must carry text_config.attn_res_num_blocks; the "
+                "fp32 fallback default has been removed to prevent a silent "
+                "block-count mismatch."
+            )
+        if config.num_hidden_layers % n_blocks != 0:
+            raise ValueError(
+                f"attn_res_num_blocks={n_blocks} does not divide "
+                f"num_hidden_layers={config.num_hidden_layers}."
+            )
+        self.layers_per_block = config.num_hidden_layers // n_blocks
 
     def _seq_shard_active(self, partial_block: torch.Tensor) -> bool:
         """Decide whether seq-dim sharding can be safely used this forward.

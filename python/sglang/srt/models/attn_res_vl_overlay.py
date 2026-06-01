@@ -143,7 +143,23 @@ def _build_frozen_siglip(vision_tower_path: str) -> nn.Module:
             "KimiAttnResVLForConditionalGeneration. Install transformers."
         ) from e
 
-    model = SiglipVisionModel.from_pretrained(vision_tower_path)
+    # ``google/siglip-base-patch16-224`` is the *full* dual-tower SigLIP
+    # checkpoint (vision_model + text_model + logit_scale/logit_bias).
+    # Loading it into the vision-only ``SiglipVisionModel`` makes HF's
+    # ``from_pretrained`` log every text-tower key as "UNEXPECTED" — ~25
+    # benign warnings that look alarming next to the AttnRes weight load
+    # ("not ok if you expect identical arch"). They are expected here (we
+    # deliberately use only the vision tower), so silence transformers'
+    # load-warning logger for the duration of this one load, then restore
+    # the previous level so nothing else in the engine is affected.
+    import transformers as _tf
+
+    _prev_verbosity = _tf.logging.get_verbosity()
+    _tf.logging.set_verbosity_error()
+    try:
+        model = SiglipVisionModel.from_pretrained(vision_tower_path)
+    finally:
+        _tf.logging.set_verbosity(_prev_verbosity)
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
@@ -300,17 +316,27 @@ class KimiAttnResVLForConditionalGeneration(nn.Module):
         return projected
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        """Our processor already inserts ``[image_token_id] * num_vision_tokens``
-        at each ``<image>`` position in input_ids, so SGLang's standard
-        post-processing is a no-op for us.
+        """Rewrite each image's placeholder span to its content-derived
+        ``pad_value`` so RadixCache prefix matching is image-content-aware.
 
-        The standard ``MultiModalityDataPaddingPatternMultimodalTokens``
-        pattern expects ``mm_items[i].offsets`` (the positions where
-        image tokens should be expanded to N feature slots). We don't
-        set offsets — instead we pre-expand at processor time. So just
-        return input_ids verbatim.
+        Our processor pre-expands every ``<image>`` into
+        ``num_vision_tokens`` copies of the constant sentinel id (32000)
+        and records the span in ``item.offsets``. If we leave those
+        constant ids in place, two requests with different images but the
+        same surrounding text produce byte-identical token prefixes, so
+        RadixCache would reuse the first image's KV for the second — wrong
+        outputs. That is why radix had to be disabled.
+
+        ``MultiModalityDataPaddingPatternMultimodalTokens`` rewrites each
+        ``item.offsets`` span to that item's ``pad_value`` (now a unique
+        content hash, set in the processor's ``_build_mm_items`` via
+        ``set_pad_value()``). The downstream embed-merge
+        (``embed_mm_inputs``) locates image positions by ``pad_value`` too,
+        so the merge still slots vision features into exactly these spans.
+        Mirrors ``sglang/srt/models/kimi_vl.py``'s pad_input_ids.
         """
-        return input_ids
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     # ------------------------------------------------------------------
     # forward + load

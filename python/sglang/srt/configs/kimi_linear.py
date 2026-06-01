@@ -48,6 +48,8 @@ class KimiLinearConfig(PretrainedConfig):
         mla_use_nope: bool | None = False,
         num_nextn_predict_layers: int = 0,
         linear_attn_config: dict | None = None,
+        attn_res_enabled: bool = False,
+        attn_res_num_blocks: int | None = None,
         **kwargs,
     ):
         self.model_type = model_type
@@ -93,6 +95,33 @@ class KimiLinearConfig(PretrainedConfig):
         self.num_expert_group = num_expert_group
         self.topk_group = topk_group
         self.num_nextn_predict_layers = num_nextn_predict_layers
+
+        # Block Attention Residual (Kimi paper §5) — formal config fields so
+        # the inference overlay validates the block count against the trained
+        # checkpoint instead of silently falling back to a hardcoded default.
+        # ``attn_res_num_blocks`` is the number of committed blocks the
+        # residual stream is partitioned into (N in the paper; S = layers per
+        # block = num_hidden_layers // N). Only meaningful when
+        # ``attn_res_enabled`` is True.
+        self.attn_res_enabled = attn_res_enabled
+        self.attn_res_num_blocks = attn_res_num_blocks
+        if attn_res_enabled:
+            if attn_res_num_blocks is None:
+                raise ValueError(
+                    "attn_res_enabled=True requires attn_res_num_blocks to be "
+                    "set (the trained block count); got None."
+                )
+            if not (1 <= attn_res_num_blocks <= num_hidden_layers):
+                raise ValueError(
+                    f"attn_res_num_blocks={attn_res_num_blocks} out of range "
+                    f"[1, num_hidden_layers={num_hidden_layers}]."
+                )
+            if num_hidden_layers % attn_res_num_blocks != 0:
+                raise ValueError(
+                    f"num_hidden_layers={num_hidden_layers} must be divisible "
+                    f"by attn_res_num_blocks={attn_res_num_blocks} (each block "
+                    f"must hold an equal number of layers)."
+                )
 
         if linear_attn_config is not None:
             assert linear_attn_config["kda_layers"] is not None
