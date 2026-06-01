@@ -11,7 +11,15 @@ from sglang.srt.layers.attention.fla.chunk_intra_token_parallel import (
 from sglang.srt.layers.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.srt.layers.attention.fla.op import exp2, gather
+# NOTE: KDA gate `g` is produced in NATURAL-log space (kda_gate_chunk_cumsum /
+# chunk_local_cumsum here apply NO RCP_LN2 rescale), and the rest of the vendored
+# KDA pipeline (chunk_delta_h, chunk_gla in kda.py) applies the decay with base-e
+# `exp`. These intra kernels must therefore also use base-e `exp` — using `exp2`
+# on a natural-log gate computes 2^g instead of e^g, which produced a ~0.5%
+# per-element drift (cos 0.9945 vs the fp64 reference) that compounds across the
+# 12 KDA layers. Upstream fla stays in log2 space (scale g by RCP_LN2 once, exp2
+# everywhere); the vendored copy is base-e everywhere instead. Keep it consistent.
+from sglang.srt.layers.attention.fla.op import exp, gather
 from sglang.srt.layers.attention.fla.utils import (
     autotune_cache_kwargs,
     is_gather_supported,
@@ -158,9 +166,9 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             # [BK]
             b_gn1 = tl.load(g + i_tc1 * H * K + o_k, mask=m_k, other=0).to(tl.float32)
             # [BC, BK]
-            b_gqn = tl.where(m_tc1[:, None], exp2(b_g1 - b_gn1[None, :]), 0)
+            b_gqn = tl.where(m_tc1[:, None], exp(b_g1 - b_gn1[None, :]), 0)
             # [BK, BC]
-            b_kgt = tl.trans(b_k0 * exp2(b_gn1[None, :] - b_g0))
+            b_kgt = tl.trans(b_k0 * exp(b_gn1[None, :] - b_g0))
             # [BC, BC]
             b_Aqk10 += tl.dot(b_q1 * b_gqn, b_kgt)
             b_Akk10 += tl.dot(b_k1 * b_gqn, b_kgt)
@@ -184,15 +192,15 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                     tl.float32
                 )
                 # [BC, BK]
-                b_gqn2 = tl.where(m_tc2[:, None], exp2(b_g2 - b_gn2[None, :]), 0)
+                b_gqn2 = tl.where(m_tc2[:, None], exp(b_g2 - b_gn2[None, :]), 0)
                 b_qg2 = b_q2 * b_gqn2
                 b_kg2 = b_k2 * b_gqn2
                 # [BK, BC]
-                b_kgt = tl.trans(b_k0 * exp2(b_gn2[None, :] - b_g0))
+                b_kgt = tl.trans(b_k0 * exp(b_gn2[None, :] - b_g0))
                 b_Aqk20 += tl.dot(b_qg2, b_kgt)
                 b_Akk20 += tl.dot(b_kg2, b_kgt)
                 # [BC, BC]
-                b_kgt = tl.trans(b_k1 * exp2(b_gn2[None, :] - b_g1))
+                b_kgt = tl.trans(b_k1 * exp(b_gn2[None, :] - b_g1))
                 # [BC, BC]
                 b_Aqk21 += tl.dot(b_qg2, b_kgt)
                 b_Akk21 += tl.dot(b_kg2, b_kgt)
@@ -216,21 +224,21 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                         tl.float32
                     )
                     # [BC, BK]
-                    b_gqn3 = tl.where(m_tc3[:, None], exp2(b_g3 - b_gn3[None, :]), 0)
+                    b_gqn3 = tl.where(m_tc3[:, None], exp(b_g3 - b_gn3[None, :]), 0)
                     b_qg3 = b_q3 * b_gqn3
                     b_kg3 = b_k3 * b_gqn3
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k0 * exp2(b_gn3[None, :] - b_g0))
+                    b_kgt = tl.trans(b_k0 * exp(b_gn3[None, :] - b_g0))
                     # [BC, BC]
                     b_Aqk30 += tl.dot(b_qg3, b_kgt)
                     b_Akk30 += tl.dot(b_kg3, b_kgt)
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k1 * exp2(b_gn3[None, :] - b_g1))
+                    b_kgt = tl.trans(b_k1 * exp(b_gn3[None, :] - b_g1))
                     # [BC, BC]
                     b_Aqk31 += tl.dot(b_qg3, b_kgt)
                     b_Akk31 += tl.dot(b_kg3, b_kgt)
                     # [BK, BC]
-                    b_kgt = tl.trans(b_k2 * exp2(b_gn3[None, :] - b_g2))
+                    b_kgt = tl.trans(b_k2 * exp(b_gn3[None, :] - b_g2))
                     # [BC, BC]
                     b_Aqk32 += tl.dot(b_qg3, b_kgt)
                     b_Akk32 += tl.dot(b_kg3, b_kgt)
@@ -522,8 +530,8 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     # less than 85 to avoid overflow in exp2
     b_gm = (b_g - b_gn).to(tl.float32)
 
-    b_gq = tl.where(m_c[:, None], exp2(b_gm), 0.0)
-    b_gk = tl.where(m_c[:, None], exp2(-b_gm), 0.0)
+    b_gq = tl.where(m_c[:, None], exp(b_gm), 0.0)
+    b_gk = tl.where(m_c[:, None], exp(-b_gm), 0.0)
 
     b_kgt = tl.trans(b_k * b_gk)
 
