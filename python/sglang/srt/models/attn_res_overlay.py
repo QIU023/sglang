@@ -92,6 +92,11 @@ _SEQ_SHARD_ENABLED = bool(int(_os.environ.get("SGLANG_ATTN_RES_SEQ_SHARD", "0"))
 #                                  the two-phase IO-amortisation gain.
 _BYPASS_ATTN_RES = bool(int(_os.environ.get("SGLANG_ATTN_RES_BYPASS", "0")))
 _FORCE_NAIVE_PATH = bool(int(_os.environ.get("SGLANG_ATTN_RES_NAIVE_PATH", "0")))
+# SGLANG_ATTN_RES_MOE_NATIVE=1 forces the reference per-expert Python-loop
+# score-before MoE (``_kimi_moe_score_before``) instead of the production
+# fused-triton path (``_kimi_moe_score_before_fused``). Kept as a numerical
+# reference / fallback; the fused path is the default and is what serving uses.
+_MOE_NATIVE_PATH = bool(int(_os.environ.get("SGLANG_ATTN_RES_MOE_NATIVE", "0")))
 
 _logger = _logging.getLogger(__name__)
 
@@ -132,6 +137,245 @@ def _kimi_moe_partial_sum(mlp, hidden_states: torch.Tensor) -> torch.Tensor:
 
     # NB: trailing tensor_model_parallel_all_reduce intentionally elided.
     return final_hidden_states.view(num_tokens, hidden_size)
+
+
+def _kimi_moe_score_before(
+    mlp, hidden_states: torch.Tensor, reduce: bool = True
+) -> torch.Tensor:
+    """Hand-written ``KimiMoE.forward`` with **score-before-experts** routing.
+
+    The torchtitan training model (``MoE.score_before_experts=True``,
+    ``models/common/moe.py:447-451``) multiplies the per-token gate weight
+    onto the expert **INPUT** (before the SwiGLU non-linearity); the routed
+    expert outputs are then **summed** (no per-output weight). SGLang's stock
+    ``KimiMoE.forward`` → ``FusedMoE`` instead multiplies the gate weight onto
+    the expert **OUTPUT** (score-after, like the Kimi HF reference). Because
+    SwiGLU is non-linear, ``swiglu(w·x) ≠ w·swiglu(x)`` → the two disagree
+    (single-layer L1 cos ≈ 0.918 + ~3× magnitude). The model was TRAINED
+    score-before, so score-before is the parity baseline.
+
+    SGLang's fused triton experts only support weight-on-input via
+    ``apply_router_weight_on_input``, which asserts ``top_k == 1`` — this
+    model is top-8, so the fused path can't be used. We instead run a native
+    per-expert SwiGLU loop reading the same fused expert weights
+    (``experts.w13_weight`` = stacked [gate; up], ``experts.w2_weight`` = down)
+    that ``FusedMoE`` already loaded from the checkpoint.
+
+    Routing (matches the in-tree ``TokenChoiceTopKRouter.forward``):
+      * ``scores = sigmoid(gate(x))``; choose top-k on ``scores + e_score_bias``
+        (``num_expert_group=1`` so no group masking).
+      * ``topk_weights = scores.gather(...)`` (RAW sigmoid, not the biased
+        choice scores); renormalize to sum 1 (``moe_renormalize=True``);
+        then ``* routed_scaling_factor`` (2.446).
+      * weight onto INPUT, SwiGLU, sum; add shared_expert(x).
+
+    ``mlp.topk`` already produces the renormalized (sum-1) ``topk_weights``
+    and ``topk_ids`` exactly as above (``apply_routed_scaling_factor_on_output``
+    is False for the unquantized triton path → topk does NOT pre-scale), so we
+    reuse it and apply ``routed_scaling_factor`` here. All expert math runs in
+    fp32 then casts back, matching the in-tree fp32 weight multiply.
+
+    ``reduce``: when True (default, non-seq-shard path) and TP world size > 1,
+    all-reduce the experts+shared sum, mirroring upstream ``KimiMoE.forward``'s
+    trailing AR. When False (seq-shard path) the caller reduce-scatters the
+    partial sum instead.
+    """
+    num_tokens, hidden_size = hidden_states.shape
+    x = hidden_states.view(-1, hidden_size)
+
+    # Shared expert (unconditional add; matches in-tree).
+    shared_output = None
+    if mlp.num_shared_experts is not None and x.shape[0] > 0:
+        shared_output = mlp.shared_experts(x)
+
+    router_logits, _ = mlp.gate(x)
+    topk_output = mlp.topk(x, router_logits)
+    topk_weights = topk_output.topk_weights  # [N, top_k] fp32, renormalized sum=1
+    topk_ids = topk_output.topk_ids  # [N, top_k] int32
+
+    # Apply Kimi's routed_scaling_factor (in-tree: route_scale after renorm).
+    scale = getattr(mlp, "routed_scaling_factor", 1.0)
+    if scale is not None and scale != 1.0:
+        topk_weights = topk_weights * scale
+
+    experts = mlp.experts
+    # FusedMoE fused expert weights (loaded from ckpt):
+    #   w13_weight [E, 2*moe_int, hidden] — gate (w1) = [:moe_int], up (w3) = [moe_int:]
+    #   w2_weight  [E, hidden, moe_int]   — down (w2)
+    w13 = experts.w13_weight  # type: ignore[attr-defined]
+    w2 = experts.w2_weight  # type: ignore[attr-defined]
+    inter = w13.shape[1] // 2
+    num_experts = w13.shape[0]
+
+    xf = x.to(torch.float32)
+    w13f = w13.to(torch.float32)
+    w2f = w2.to(torch.float32)
+    tw = topk_weights.to(torch.float32)
+
+    out = x.new_zeros(x.shape, dtype=torch.float32)
+    # token-major (N, top_k) selection; for each expert gather its assigned
+    # (token, slot) pairs, weight the INPUT, SwiGLU, scatter-add the output.
+    for e in range(num_experts):
+        sel = topk_ids == e  # [N, top_k]
+        if not bool(sel.any()):
+            continue
+        tok_idx, slot = sel.nonzero(as_tuple=True)
+        w = tw[tok_idx, slot].unsqueeze(-1)  # [n, 1]
+        xe = xf[tok_idx] * w  # weight on INPUT (score-before)
+        gate_up = xe @ w13f[e].t()  # [n, 2*inter]
+        gate_h = F.silu(gate_up[:, :inter]) * gate_up[:, inter:]  # [n, inter]
+        ye = gate_h @ w2f[e].t()  # [n, hidden]
+        out.index_add_(0, tok_idx, ye)
+
+    final_hidden_states = out.to(x.dtype)
+    if shared_output is not None:
+        final_hidden_states = final_hidden_states + shared_output
+
+    if reduce:
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_world_size,
+            tensor_model_parallel_all_reduce,
+        )
+
+        if get_tensor_model_parallel_world_size() > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+    return final_hidden_states.view(num_tokens, hidden_size)
+
+
+def _configure_fused_moe_score_before(mlp) -> None:
+    """One-time mutation of this MoE's FusedMoE runner config for score-before.
+
+    Score-before-experts (the training semantics) is mathematically identical
+    to SGLang's stock ``apply_router_weight_on_input=True`` path: the fused
+    triton experts multiply the per-(token,expert) routing weight onto the
+    permuted expert **input** rows in the first (gate/up) GEMM
+    (``MUL_ROUTED_WEIGHT`` on GEMM1) and do **not** re-multiply on the second
+    (down) GEMM (``not apply_router_weight_on_input`` → False on GEMM2). The
+    final ``moe_sum`` reduction then sums the (already input-weighted) expert
+    outputs. That is exactly ``sum_e down(swiglu((w_e · x) · W13_e))``.
+
+    The stock ``top_k == 1`` assertion only exists on the cutlass-w4a8 / ROCm
+    AITER quant paths (``cutlass_w4a8_moe.py:124``, ``rocm_moe_utils.py:99``,
+    ``moe_runner/aiter.py:70``). The unquantized CUDA **triton** kernel that
+    this bf16 model uses has NO such restriction: ``MUL_ROUTED_WEIGHT`` loads
+    ``topk_weights_ptr[offs_token]`` per permuted row (``fused_moe_triton_kernels.py:702``),
+    where ``offs_token`` ranges over all ``num_tokens * top_k`` rows — fully
+    top-k-agnostic. So the assertion is a backend-specific guard, not a
+    fundamental constraint; the triton path is safe for top-8.
+
+    Two subtleties handled by ``_kimi_moe_score_before_fused``:
+
+    * **Where ``routed_scaling_factor`` (2.446) is applied matters.** In-tree
+      (``models/common/moe.py:254-266``) renormalizes the top-k weights to
+      sum 1, multiplies by ``route_scale`` (2.446), THEN multiplies that full
+      weight onto the expert input (before SwiGLU). SGLang's fused path,
+      however, applies ``routed_scaling_factor`` at ``moe_sum`` — i.e. on the
+      expert **output**, after the (nonlinear) SwiGLU. Because SwiGLU is
+      nonlinear, ``down(swiglu(2.446·w·x·W13)) ≠ 2.446·down(swiglu(w·x·W13))``.
+      To match in-tree we therefore (a) **fold 2.446 into the topk_weights**
+      so the full ``renorm·2.446`` weight lands on the input, and (b) set the
+      runner's ``routed_scaling_factor = 1.0`` so ``moe_sum`` does not
+      re-apply it.
+
+    * The unquantized triton path leaves topk weights renormalized-to-1 (NOT
+      pre-scaled), since ``apply_routed_scaling_factor_on_output`` is False
+      (``fused_moe_triton/layer.py:304`` → False for unquantized triton).
+    """
+    experts = mlp.experts
+    cfg = getattr(experts, "moe_runner_config", None)
+    if cfg is None:
+        # Quantized / non-triton backend without a mutable runner config — the
+        # caller will fall back to the native loop.
+        return
+    # ``moe_runner_config`` is shared by reference: layer.moe_runner_config is
+    # quant_method.moe_runner_config is runner.config (see
+    # UnquantizedFusedMoEMethod.create_moe_runner). Mutating it here is read at
+    # kernel-launch time (moe_runner/triton.py:123-124).
+    cfg.apply_router_weight_on_input = True
+    # We pre-scale topk_weights by routed_scaling_factor ourselves (folded onto
+    # the input), so the kernel's moe_sum must NOT multiply by it again.
+    cfg.routed_scaling_factor = 1.0
+    experts._attnres_score_before_configured = True
+
+
+def _kimi_moe_score_before_fused(
+    mlp, hidden_states: torch.Tensor, reduce: bool = True
+) -> torch.Tensor:
+    """Production score-before MoE forward using the fused triton experts.
+
+    Numerically equivalent to the reference ``_kimi_moe_score_before`` loop but
+    runs the routed experts through SGLang's optimized fused kernel
+    (``apply_router_weight_on_input=True``; see
+    ``_configure_fused_moe_score_before`` for the math and why the top-8
+    restriction does not apply to the triton path).
+
+    Routing / scaling alignment with in-tree:
+      * ``mlp.topk`` returns renormalized (sum-1) ``topk_weights`` (the
+        unquantized triton path does NOT pre-scale by routed_scaling_factor).
+      * We fold ``routed_scaling_factor`` (2.446) into those weights and hand
+        the scaled weights to ``mlp.experts`` (which now weights the INPUT).
+      * The runner's ``routed_scaling_factor`` was set to 1.0 at __init__ so
+        ``moe_sum`` does not double-apply it.
+      * The shared expert is added unconditionally (matches in-tree); its AR is
+        already disabled (``reduce_results=False``), so we control the trailing
+        all-reduce ourselves.
+
+    ``reduce``: same contract as ``_kimi_moe_score_before``.
+    """
+    num_tokens, hidden_size = hidden_states.shape
+    x = hidden_states.view(-1, hidden_size)
+
+    # Lazily ensure the runner is configured for score-before. Normally done
+    # once at decoder-layer __init__, but guard here so this fn is safe to call
+    # standalone (e.g. parity harnesses).
+    experts = mlp.experts
+    if not getattr(experts, "_attnres_score_before_configured", False):
+        _configure_fused_moe_score_before(mlp)
+        if not getattr(experts, "_attnres_score_before_configured", False):
+            # No mutable fused runner config (quant backend) — fall back.
+            return _kimi_moe_score_before(mlp, hidden_states, reduce=reduce)
+
+    shared_output = None
+    if mlp.num_shared_experts is not None and x.shape[0] > 0:
+        shared_output = mlp.shared_experts(x)
+
+    router_logits, _ = mlp.gate(x)
+    topk_output = mlp.topk(x, router_logits)
+
+    # Fold routed_scaling_factor onto the (renormalized, sum-1) topk weights so
+    # the full ``renorm · 2.446`` weight is multiplied onto the expert INPUT by
+    # the fused kernel (matching in-tree score-before). topk_weights is fp32.
+    scale = getattr(mlp, "routed_scaling_factor", 1.0)
+    if scale is not None and scale != 1.0:
+        scaled_weights = topk_output.topk_weights * scale
+        topk_output = topk_output._replace(topk_weights=scaled_weights)
+
+    final_hidden_states = experts(x, topk_output)
+
+    if shared_output is not None:
+        final_hidden_states = final_hidden_states + shared_output
+
+    if reduce:
+        from sglang.srt.distributed import (
+            get_tensor_model_parallel_world_size,
+            tensor_model_parallel_all_reduce,
+        )
+
+        if get_tensor_model_parallel_world_size() > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+
+    return final_hidden_states.view(num_tokens, hidden_size)
+
+
+def _kimi_moe_score_before_dispatch(
+    mlp, hidden_states: torch.Tensor, reduce: bool = True
+) -> torch.Tensor:
+    """Route to the production fused score-before path (default) or the native
+    reference loop (``SGLANG_ATTN_RES_MOE_NATIVE=1``)."""
+    if _MOE_NATIVE_PATH:
+        return _kimi_moe_score_before(mlp, hidden_states, reduce=reduce)
+    return _kimi_moe_score_before_fused(mlp, hidden_states, reduce=reduce)
 
 
 def _is_kimi_moe(mlp) -> bool:
@@ -218,6 +462,25 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
         self.mlp_res_norm = RMSNorm(d, eps=config.rms_norm_eps)
         _zero_init(self.attn_res_proj)
         _zero_init(self.mlp_res_proj)
+
+        # MoE routing convention for this checkpoint (config-driven). When the
+        # config carries ``moe_score_before_experts=True`` (our AttnRes
+        # Kimi-Linear was TRAINED with torchtitan ``MoE.score_before_experts=
+        # True``), the router gate weight multiplies the expert INPUT
+        # (pre-SwiGLU); routed outputs are then summed. Default False keeps the
+        # stock score-after (weight on output) of official Kimi-Linear, so a
+        # standard checkpoint loaded through this overlay is untouched.
+        self._moe_score_before = bool(
+            getattr(config, "moe_score_before_experts", False)
+        )
+        # Pre-configure the fused triton experts for the production
+        # apply_router_weight_on_input path (folded routed_scaling_factor).
+        # No-op for the dense layer-0 KimiMLP and for quant backends without a
+        # mutable fused runner config (the forward falls back to the native
+        # reference loop). Native loop also selectable via
+        # SGLANG_ATTN_RES_MOE_NATIVE=1.
+        if self._moe_score_before and not _MOE_NATIVE_PATH and _is_kimi_moe(self.mlp):
+            _configure_fused_moe_score_before(self.mlp)
 
         # Seq-shard mode: disable in-projection all-reduce so the caller
         # can reduce-scatter the partial sum along seq dim and run AttnRes
@@ -455,13 +718,22 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
             mlp_in_shard = self.post_attention_layernorm(mlp_input)
             mlp_in_replicated = all_gather_seq(mlp_in_shard)
             # MoE layers: KimiMoE has a hardcoded all-reduce in its forward
-            # (no ``reduce_results`` flag). Use ``_kimi_moe_partial_sum`` to
-            # call the underlying gate / topk / experts modules in the same
-            # order as upstream KimiMoE.forward, but skip the trailing AR.
+            # (no ``reduce_results`` flag), so we call the gate/topk/experts
+            # in the same order but skip the trailing AR and let the caller
+            # reduce-scatter the partial sum along the seq dim.
             # Dense KimiMLP layer has ``down_proj.reduce_results=False`` set
             # at __init__, so its forward already returns the partial sum.
             if _is_kimi_moe(self.mlp):
-                mlp_partial = _kimi_moe_partial_sum(self.mlp, mlp_in_replicated)
+                if self._moe_score_before:
+                    # score-before parity path (see __init__); reduce=False.
+                    mlp_partial = _kimi_moe_score_before_dispatch(
+                        self.mlp, mlp_in_replicated, reduce=False
+                    )
+                else:
+                    # stock score-after, AR skipped for the caller's r-scatter.
+                    mlp_partial = _kimi_moe_partial_sum(
+                        self.mlp, mlp_in_replicated
+                    )
             else:
                 mlp_partial = self.mlp(mlp_in_replicated)
             return reduce_scatter_seq(mlp_partial)
@@ -470,12 +742,19 @@ class KimiAttnResDecoderLayer(KimiDecoderLayer):
         # Same correctness fix as _run_attn: when seq-shard env is set but
         # this particular forward fell back to replicated, the dense
         # ``down_proj.reduce_results=False`` (set at __init__) means MLP
-        # returns a partial sum. KimiMoE has a hardcoded AR in its forward
-        # which DOES still fire under seq_shard=False (because we don't
-        # invoke ``_kimi_moe_partial_sum``), so we only need to AR-fix the
-        # dense path.
+        # returns a partial sum. The MoE path (either convention) does its own
+        # hardcoded AR, so we only need to AR-fix the dense path below.
         if _is_kimi_moe(self.mlp):
-            return self.mlp(ffn_in)  # KimiMoE.forward did its own AR
+            if self._moe_score_before:
+                # Score-before-experts MoE forward for train↔infer parity (this
+                # ckpt was trained with MoE.score_before_experts=True; stock
+                # KimiMoE.forward is score-after → ~9pt GQA gap). Production path
+                # runs the fused triton experts (apply_router_weight_on_input);
+                # ``SGLANG_ATTN_RES_MOE_NATIVE=1`` selects the reference loop.
+                # Does its own trailing AR (reduce=True), matching KimiMoE.forward.
+                return _kimi_moe_score_before_dispatch(self.mlp, ffn_in, reduce=True)
+            # stock score-after: KimiMoE.forward does its own hardcoded AR.
+            return self.mlp(ffn_in)
         mlp_out = self.mlp(ffn_in)
         if _SEQ_SHARD_ENABLED:
             from sglang.srt.distributed import (

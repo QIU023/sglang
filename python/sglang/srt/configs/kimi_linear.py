@@ -50,6 +50,7 @@ class KimiLinearConfig(PretrainedConfig):
         linear_attn_config: dict | None = None,
         attn_res_enabled: bool = False,
         attn_res_num_blocks: int | None = None,
+        moe_score_before_experts: bool = False,
         **kwargs,
     ):
         self.model_type = model_type
@@ -86,6 +87,15 @@ class KimiLinearConfig(PretrainedConfig):
         self.moe_renormalize = moe_renormalize
         self.num_shared_experts = num_shared_experts
         self.routed_scaling_factor = routed_scaling_factor
+        # When True, the router gate weight is multiplied onto the expert
+        # INPUT (before the SwiGLU), then the routed outputs are summed —
+        # the torchtitan ``MoE.score_before_experts=True`` convention this
+        # checkpoint was TRAINED with. Default False = the standard
+        # score-after (weight on expert output) of official Kimi-Linear /
+        # DeepSeek-V3 / the HF reference, so stock Kimi-Linear is untouched.
+        # Only the AttnRes overlay reads this (sets FusedMoE
+        # ``apply_router_weight_on_input``); see attn_res_overlay.py.
+        self.moe_score_before_experts = moe_score_before_experts
         self.moe_router_activation_func = moe_router_activation_func
         assert self.moe_router_activation_func in ("softmax", "sigmoid")
         self.moe_intermediate_size = moe_intermediate_size
@@ -188,3 +198,59 @@ class KimiLinearConfig(PretrainedConfig):
         )
 
         return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid linear-attention (KDA) <-> MambaRadixCache wiring.
+#
+# Kimi-Linear interleaves KDA linear-attention layers with full MLA layers and
+# keeps a recurrent SSM state per KDA layer. A plain RadixCache reuses token-id
+# prefixes but never checkpoints that recurrent state, so a prefix-cache hit
+# feeds KDA a state that was never saved at the prefix boundary -> dirty state
+# -> image-blind / inconsistent generations (see kda_backend.forward_extend
+# ``has_initial_state``). The fix is to route Kimi-Linear through
+# ``MambaRadixCache`` (which snapshots / forks / evicts the SSM state alongside
+# the token prefix). That selection is gated by ``Scheduler.is_hybrid_ssm``,
+# which becomes True iff a registered ``LinearAttnModelSpec`` for this model
+# sets ``uses_mamba_radix_cache=True``.
+#
+# We register here (module import time, pulled in transitively via
+# ``sglang.srt.configs.__init__`` long before ``ServerArgs`` runs its
+# per-model adjustments) so both the by-config lookup
+# (``get_linear_attn_config`` -> is_hybrid_ssm) and the by-arch lookup
+# (``get_linear_attn_spec_by_arch`` -> ServerArgs page_size=1 / overlap-off)
+# resolve.
+#
+# ``unwrap_text_config=True``: the by-config lookup calls
+# ``hf_config.get_text_config()`` first, so the multimodal carrier
+# ``KimiAttnResVLConfig`` (whose ``text_config`` IS a ``KimiLinearConfig``)
+# also matches; for the bare LM configs ``get_text_config()`` returns ``self``.
+#
+# ``arch_names``: the deployed ``architectures[0]`` strings. The VLM carrier is
+# ``KimiAttnResVLForConditionalGeneration``; the text-only overlay /
+# upstream LM are ``KimiBlockAttnResForCausalLM`` / ``KimiLinearForCausalLM``.
+from sglang.srt.configs.linear_attn_model_registry import (  # noqa: E402
+    LinearAttnModelSpec,
+    register_linear_attn_model,
+)
+
+register_linear_attn_model(
+    LinearAttnModelSpec(
+        config_class=KimiLinearConfig,
+        backend_class_name=(
+            "sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend"
+        ),
+        arch_names=[
+            "KimiAttnResVLForConditionalGeneration",
+            "KimiBlockAttnResForCausalLM",
+            "KimiLinearForCausalLM",
+        ],
+        uses_mamba_radix_cache=True,
+        support_mamba_cache=True,
+        # MambaRadixCache v1 has no extra-buffer support for KDA yet; keep the
+        # no_buffer path (page_size=1 + overlap-off), which ServerArgs selects
+        # when this is False.
+        support_mamba_cache_extra_buffer=False,
+        unwrap_text_config=True,
+    )
+)

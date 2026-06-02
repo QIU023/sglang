@@ -2146,7 +2146,19 @@ class ServerArgs:
             logger.info(
                 f"Using {self.attention_backend} as attention backend for {model_arch}."
             )
-        elif model_arch in ["KimiLinearForCausalLM", "BailingMoeV2_5ForCausalLM"]:
+        elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
+            # NOTE: KimiLinearForCausalLM was removed from this branch. It used
+            # to force support_mamba_cache=False (radix off) because no
+            # MambaRadixCache wiring existed for KDA. It is now registered via
+            # register_linear_attn_model() (see configs/kimi_linear.py), so the
+            # registry path above (get_linear_attn_spec_by_arch) already calls
+            # _handle_mamba_radix_cache(support_mamba_cache=True) -> page_size=1
+            # + overlap-off + MambaRadixCache. Re-running it here with
+            # support_mamba_cache=False would disable radix again. The
+            # multimodal carrier (KimiAttnResVLForConditionalGeneration) and the
+            # text overlay (KimiBlockAttnResForCausalLM) never reached this
+            # branch (not in this elif-chain), so only the bare-LM arch needed
+            # this change.
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=False,
