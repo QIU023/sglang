@@ -161,3 +161,46 @@ class KimiLinearConfig(PretrainedConfig):
         )
 
         return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid linear-attention (KDA) <-> MambaRadixCache wiring.
+#
+# Kimi-Linear interleaves KDA linear-attention layers with full MLA layers and
+# keeps a recurrent SSM state per KDA layer. A plain RadixCache reuses token-id
+# prefixes but never checkpoints that recurrent state, so a prefix-cache hit
+# feeds KDA a state that was never saved at the prefix boundary -> dirty state
+# -> inconsistent generations (see kda_backend.forward_extend
+# ``has_initial_state``). The fix is to route Kimi-Linear through
+# ``MambaRadixCache`` (which snapshots / forks / evicts the SSM state alongside
+# the token prefix). That selection is gated by ``Scheduler.is_hybrid_ssm``,
+# which becomes True iff a registered ``LinearAttnModelSpec`` for this model
+# sets ``uses_mamba_radix_cache=True``.
+#
+# We register here (module import time, pulled in transitively via
+# ``sglang.srt.configs.__init__`` long before ``ServerArgs`` runs its
+# per-model adjustments) so both the by-config lookup
+# (``get_linear_attn_config`` -> is_hybrid_ssm) and the by-arch lookup
+# (``get_linear_attn_spec_by_arch`` -> ServerArgs page_size=1 / overlap-off)
+# resolve.
+from sglang.srt.configs.linear_attn_model_registry import (  # noqa: E402
+    LinearAttnModelSpec,
+    register_linear_attn_model,
+)
+
+register_linear_attn_model(
+    LinearAttnModelSpec(
+        config_class=KimiLinearConfig,
+        backend_class_name=(
+            "sglang.srt.layers.attention.linear.kda_backend.KDAAttnBackend"
+        ),
+        arch_names=["KimiLinearForCausalLM"],
+        uses_mamba_radix_cache=True,
+        support_mamba_cache=True,
+        # MambaRadixCache v1 has no extra-buffer support for KDA yet; keep the
+        # no_buffer path (page_size=1 + overlap-off), which ServerArgs selects
+        # when this is False.
+        support_mamba_cache_extra_buffer=False,
+        unwrap_text_config=True,
+    )
+)
