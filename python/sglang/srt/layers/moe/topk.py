@@ -846,7 +846,8 @@ def biased_grouped_topk_gpu(
         # flashinfer's fused_topk_deepseek
         fused_topk_deepseek(
             gating_output.to(dtype=torch.float32),
-            correction_bias,
+            (correction_bias.to(torch.float32)
+             if correction_bias is not None else None),
             num_expert_group,
             topk_group,
             topk_routed,
@@ -878,7 +879,8 @@ def biased_grouped_topk_gpu(
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
-            correction_bias,
+            (correction_bias.to(torch.float32)
+             if correction_bias is not None else None),
             num_expert_group,
             topk_group,
             topk,
@@ -915,7 +917,8 @@ def biased_grouped_topk_gpu(
     ):
         topk_weights, topk_ids = moe_fused_gate(
             gating_output.to(dtype=torch.float32),
-            correction_bias,
+            (correction_bias.to(torch.float32)
+             if correction_bias is not None else None),
             num_expert_group,
             topk_group,
             topk,
@@ -930,7 +933,8 @@ def biased_grouped_topk_gpu(
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
             return kimi_k2_moe_fused_gate(
                 gating_output.to(dtype=torch.float32),
-                correction_bias,
+                (correction_bias.to(torch.float32)
+                 if correction_bias is not None else None),
                 topk=topk,
                 renormalize=renormalize,
                 routed_scaling_factor=routed_scaling_factor,

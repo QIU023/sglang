@@ -258,6 +258,10 @@ class RMSNorm(MultiPlatformOp):
                 residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
+        # flashinfer's CUTE rmsnorm needs an 8-stride-aligned input; the MLA
+        # path feeds a non-contiguous latent-cache slice (k_nope), so densify.
+        if not x.is_contiguous():
+            x = x.contiguous()
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         if needs_reshape:
             out = out.reshape(original_shape)
